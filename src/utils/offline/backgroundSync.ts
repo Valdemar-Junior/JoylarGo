@@ -1,0 +1,636 @@
+import { supabase } from '../../supabase/client';
+import { OfflineStorage, SyncQueue, NetworkStatus } from './storage';
+import { toast } from 'sonner';
+
+export class BackgroundSyncService {
+  private static instance: BackgroundSyncService;
+  private syncInterval: NodeJS.Timeout | null = null;
+  private isSyncing = false;
+
+  private constructor() {
+    this.initialize();
+  }
+
+  public static getInstance(): BackgroundSyncService {
+    if (!BackgroundSyncService.instance) {
+      BackgroundSyncService.instance = new BackgroundSyncService();
+    }
+    return BackgroundSyncService.instance;
+  }
+
+  private initialize(): void {
+    // Listen for network status changes
+    NetworkStatus.addListener((online) => {
+      if (online) {
+        this.startSync();
+      } else {
+        this.stopSync();
+      }
+    });
+
+    // Start sync if online
+    if (NetworkStatus.isOnline()) {
+      this.startSync();
+    }
+  }
+
+  public startSync(): void {
+    if (this.syncInterval) {
+      return; // Already running
+    }
+
+    console.log('Starting background sync...');
+
+    // Sync immediately when coming online
+    this.syncPendingItems();
+
+    // Set up periodic sync (every 30 seconds)
+    this.syncInterval = setInterval(() => {
+      this.syncPendingItems();
+    }, 30000);
+  }
+
+  public stopSync(): void {
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+      this.syncInterval = null;
+      console.log('Background sync stopped');
+    }
+  }
+
+  private syncPromise: Promise<number> | null = null;
+
+  public async forceSync(silent = false): Promise<number> {
+    if (!NetworkStatus.isOnline()) {
+      if (!silent) toast.error('Sem conexão com a internet');
+      return 0;
+    }
+
+    // Se já estiver sincronizando, retorna a promessa atual
+    if (this.syncPromise) {
+      return this.syncPromise;
+    }
+
+    if (!silent) toast.info('Sincronizando dados...');
+    return this.syncPendingItems(silent);
+  }
+
+  private async syncPendingItems(silent = false): Promise<number> {
+    // Evita múltiplas chamadas
+    if (!NetworkStatus.isOnline()) {
+      return 0;
+    }
+
+    // Se já existe uma promessa rodando, retorna ela (embora o forceSync já trate isso,
+    // o sync periódico chama este método direto)
+    if (this.syncPromise) {
+      return this.syncPromise;
+    }
+
+    this.isSyncing = true;
+
+    // Cria nova promessa para esta execução
+    this.syncPromise = (async () => {
+      let syncedCount = 0;
+      try {
+        const pendingItems = await SyncQueue.getPendingItems();
+
+        if (pendingItems.length === 0) {
+          return 0;
+        }
+
+        console.log(`Syncing ${pendingItems.length} pending items...`);
+
+        for (const item of pendingItems) {
+          try {
+            await this.syncItem(item);
+            await SyncQueue.updateItemStatus(item.id, 'completed');
+            syncedCount++;
+          } catch (error) {
+            console.error(`Failed to sync item ${item.id}:`, error);
+            await SyncQueue.updateItemStatus(item.id, 'failed', item.attempts + 1);
+            // Log immediately on first failure to debug issues
+            if (item.attempts >= 0) {
+              await this.logSyncError(item, error as Error);
+            }
+          }
+        }
+
+        if (syncedCount > 0) {
+          await SyncQueue.removeCompletedItems();
+          if (!silent) toast.success(`${syncedCount} sincronizações concluídas`);
+        }
+
+        return syncedCount;
+
+      } catch (error) {
+        console.error('Error during sync:', error);
+        return 0;
+      } finally {
+        this.isSyncing = false;
+        this.syncPromise = null; // Limpa a promessa ao terminar
+      }
+    })();
+
+    return this.syncPromise;
+  }
+
+  private async syncItem(item: any): Promise<void> {
+    switch (item.type) {
+      case 'delivery_confirmation':
+        await this.syncDeliveryConfirmation(item.data);
+        break;
+      case 'assembly_confirmation':
+        await this.syncAssemblyConfirmation(item.data);
+        break;
+      case 'assembly_return':
+        await this.syncAssemblyReturn(item.data);
+        break;
+      case 'return_revert':
+        await this.syncReturnRevert(item.data);
+        break;
+      case 'delivery_revert':
+        await this.syncDeliveryRevert(item.data);
+        break;
+      case 'order_update':
+        await this.syncOrderUpdate(item.data);
+        break;
+      case 'assembly_undo':
+        await this.syncAssemblyUndo(item.data);
+        break;
+      case 'route_completion':
+        await this.syncRouteCompletion(item.data);
+        break;
+      case 'assembly_route_completion':
+        await this.syncAssemblyRouteCompletion(item.data);
+        break;
+      default:
+        console.warn(`Unknown sync item type: ${item.type}`);
+    }
+  }
+
+  // REMOVIDO: syncAssemblyUpdate - código legado não utilizado
+  // Clones são criados apenas na finalização da rota (syncAssemblyRouteCompletion ou finalizeRoute)
+
+  // Sync assembly confirmation (marcado como montado) - usa item_id
+  private async syncAssemblyConfirmation(data: any): Promise<void> {
+    const { item_id, route_id, action, local_timestamp } = data || {};
+    console.log('[BackgroundSync] syncAssemblyConfirmation:', { item_id, route_id, action });
+
+    if (!item_id) throw new Error('Invalid assembly_confirmation payload: missing item_id');
+
+    if (action === 'completed') {
+      const { error } = await supabase
+        .from('assembly_products')
+        .update({ status: 'completed', completion_date: local_timestamp })
+        .eq('id', item_id);
+
+      if (error) {
+        console.error('[BackgroundSync] Error syncing assembly confirmation:', error);
+        throw error;
+      }
+      console.log('[BackgroundSync] Assembly confirmation synced successfully:', item_id);
+    }
+  }
+
+  // Sync assembly return (marcado como retorno) - usa item_id
+  // NOTA: Clones são criados APENAS na finalização da rota para evitar duplicação
+  private async syncAssemblyReturn(data: any): Promise<void> {
+    const { item_id, route_id, return_reason, observations, local_timestamp } = data || {};
+    console.log('[BackgroundSync] syncAssemblyReturn:', { item_id, route_id });
+
+    if (!item_id) throw new Error('Invalid assembly_return payload: missing item_id');
+
+    const { error, count } = await supabase
+      .from('assembly_products')
+      .update({
+        status: 'cancelled',
+        return_reason: return_reason || null,
+        observations: observations || null,
+        returned_at: local_timestamp || new Date().toISOString()
+      })
+      .eq('id', item_id)
+      .select('id', { count: 'exact' });
+
+    if (error) {
+      console.error('[BackgroundSync] Error syncing assembly return:', error);
+      throw error;
+    }
+
+    if (count === 0) {
+      console.error('[BackgroundSync] WARNING: Update returned 0 rows affected for item:', item_id);
+      // Log extra details to debug
+      console.error('[BackgroundSync] Debug context:', { item_id, route_id, userId: (await supabase.auth.getUser()).data.user?.id });
+      throw new Error(`Item ${item_id} not found or permission denied (rows: 0)`);
+    }
+
+    console.log('[BackgroundSync] Assembly return synced successfully:', item_id, 'Rows:', count);
+  }
+
+
+  private async syncRouteCompletion(data: any): Promise<void> {
+    const { route_id } = data;
+    if (!route_id) throw new Error('Invalid route_completion payload');
+
+    // 1. Mark route as completed
+    const { error } = await supabase.from('routes').update({ status: 'completed' }).eq('id', route_id);
+    if (error) throw error;
+
+    // 2. Release returned orders for routing
+    const { data: returnedOrders } = await supabase
+      .from('route_orders')
+      .select('order_id')
+      .eq('route_id', route_id)
+      .eq('status', 'returned');
+
+    if (returnedOrders && returnedOrders.length > 0) {
+      const orderIds = returnedOrders.map(ro => ro.order_id);
+      await supabase
+        .from('orders')
+        .update({ status: 'pending' })
+        .in('id', orderIds);
+    }
+
+    console.log('[BackgroundSync] Route completed and returns released:', route_id);
+
+    // 3. (NEW) Generate Assembly Tasks for DELIVERED orders in this route
+    try {
+      const { data: routeOrders } = await supabase
+        .from('route_orders')
+        .select(`
+          order_id,
+          status,
+          order:order_id (
+            id, order_id_erp, items_json, customer_name, phone, address_json
+          )
+        `)
+        .eq('route_id', route_id)
+        .eq('status', 'delivered');
+
+      if (routeOrders && routeOrders.length > 0) {
+        console.log(`[BackgroundSync] Checking assembly requirements for ${routeOrders.length} delivered orders in route ${route_id}`);
+
+        for (const ro of routeOrders) {
+          const orderData = ro.order as any;
+          if (!orderData || !orderData.items_json) continue;
+
+          const produtosComMontagem = orderData.items_json.filter((item: any) =>
+            ['SIM', 'sim', 'Sim', 'true', '1', 'yes', 'YES', 'Yes'].includes(String(item.has_assembly)) ||
+            item.possui_montagem === true || item.possui_montagem === 'true'
+          );
+
+          if (produtosComMontagem.length > 0) {
+            // Verificar se já existe registro de montagem para este pedido para evitar duplicidade
+            const { count } = await supabase
+              .from('assembly_products')
+              .select('id', { count: 'exact', head: true })
+              .eq('order_id', orderData.id);
+
+            if (!count || count === 0) {
+              const assemblyProducts = produtosComMontagem.map((item: any) => ({
+                order_id: orderData.id,
+                product_name: item.name,
+                product_sku: item.sku,
+                customer_name: orderData.customer_name,
+                customer_phone: orderData.phone,
+                installation_address: orderData.address_json,
+                status: 'pending',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+              }));
+
+              const { error: insertError } = await supabase.from('assembly_products').insert(assemblyProducts);
+              if (insertError) {
+                console.error('[BackgroundSync] Failed to insert assembly_products:', insertError);
+              } else {
+                console.log(`[BackgroundSync] Created ${assemblyProducts.length} assembly products for order ${orderData.id}`);
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[BackgroundSync] Error generating assembly tasks for route:', e);
+    }
+  }
+
+  // Sync assembly route completion (finalização de rota de MONTAGEM)
+  private async syncAssemblyRouteCompletion(data: any): Promise<void> {
+    const { route_id, local_timestamp } = data;
+    if (!route_id) throw new Error('Invalid assembly_route_completion payload');
+
+    console.log('[BackgroundSync] syncAssemblyRouteCompletion:', route_id);
+
+    // 0. VERIFICAÇÃO DE SEGURANÇA: Não finalizar se houver itens pendentes (aguardando sync)
+    const { count: pendingCount } = await supabase
+      .from('assembly_products')
+      .select('id', { count: 'exact', head: true })
+      .eq('assembly_route_id', route_id)
+      .eq('status', 'pending');
+
+    if (pendingCount && pendingCount > 0) {
+      console.warn(`[BackgroundSync] Cannot complete route ${route_id}: ${pendingCount} items still pending.`);
+      throw new Error(`Route still has pending items. Waiting for item sync.`);
+    }
+
+    // 1. Mark assembly route as completed (non-blocking flow for clone failures)
+    const { error } = await supabase.from('assembly_routes').update({ status: 'completed' }).eq('id', route_id);
+    if (error) {
+      console.error('[BackgroundSync] Error completing assembly route:', error);
+      throw error;
+    }
+
+    // 2. Try to reconcile returned clones by COUNT (best effort, no throw)
+    try {
+      const { data: returnedItems } = await supabase
+        .from('assembly_products')
+        .select('*')
+        .eq('assembly_route_id', route_id)
+        .eq('status', 'cancelled');
+
+      if (returnedItems && returnedItems.length > 0) {
+        const grouped = new Map<string, { item: any; returnedCount: number }>();
+
+        for (const item of returnedItems) {
+          const skuKey = item.product_sku === null || item.product_sku === undefined ? '__null__' : String(item.product_sku);
+          const key = `${item.order_id}::${skuKey}`;
+          const current = grouped.get(key);
+          if (current) {
+            current.returnedCount += 1;
+          } else {
+            grouped.set(key, { item, returnedCount: 1 });
+          }
+        }
+
+        const clonesToInsert: any[] = [];
+
+        for (const { item, returnedCount } of grouped.values()) {
+          let countQuery: any = supabase
+            .from('assembly_products')
+            .select('id', { count: 'exact', head: true })
+            .eq('order_id', item.order_id)
+            .eq('status', 'pending')
+            .is('assembly_route_id', null);
+
+          if (item.product_sku === null || item.product_sku === undefined) {
+            countQuery = countQuery.is('product_sku', null);
+          } else {
+            countQuery = countQuery.eq('product_sku', item.product_sku);
+          }
+
+          const { count: existingCount, error: countError } = await countQuery;
+          if (countError) {
+            console.error('[BackgroundSync] Error counting existing clones:', countError);
+            continue;
+          }
+
+          const missingCount = returnedCount - (existingCount || 0);
+          if (missingCount <= 0) continue;
+
+          for (let i = 0; i < missingCount; i++) {
+            clonesToInsert.push({
+              order_id: item.order_id,
+              product_name: item.product_name,
+              product_sku: item.product_sku ?? null,
+              customer_name: item.customer_name,
+              customer_phone: item.customer_phone,
+              installation_address: item.installation_address,
+              status: 'pending',
+              observations: null,
+              assembly_route_id: null,
+              was_returned: true
+            });
+          }
+        }
+
+        if (clonesToInsert.length > 0) {
+          const { error: insertError } = await supabase.from('assembly_products').insert(clonesToInsert);
+          if (insertError) {
+            console.error('[BackgroundSync] Error inserting clones:', insertError);
+          } else {
+            console.log('[BackgroundSync] Created returned clones:', clonesToInsert.length);
+          }
+        }
+      }
+    } catch (cloneErr) {
+      console.error('[BackgroundSync] Clone reconciliation failed (non-blocking):', cloneErr);
+    }
+
+    console.log('[BackgroundSync] Assembly route completed successfully:', route_id);
+  }
+
+  private async syncDeliveryConfirmation(data: any): Promise<void> {
+    const { order_id, route_id, action, signature, local_timestamp, user_id } = data;
+
+    const updateData: any = { status: action };
+    if (action === 'delivered') updateData.delivered_at = local_timestamp;
+    if (action === 'returned') {
+      updateData.returned_at = local_timestamp;
+      if (data.return_reason) updateData.return_reason = data.return_reason;
+      if (data.observations) updateData.return_notes = data.observations;
+    }
+    if (signature) updateData.signature_url = signature;
+
+    const { error } = await supabase
+      .from('route_orders')
+      .update(updateData)
+      .eq('order_id', order_id)
+      .eq('route_id', route_id);
+
+    if (error) {
+      throw new Error(`Failed to update route order: ${error.message}`);
+    }
+
+    if (action === 'delivered') {
+      const { error: orderError } = await supabase
+        .from('orders')
+        .update({ status: 'delivered', return_flag: false, last_return_reason: null, last_return_notes: null })
+        .eq('id', order_id);
+      if (orderError) console.warn('Failed to update order status:', orderError);
+    } else if (action === 'returned') {
+      const { error: orderError2 } = await supabase
+        .from('orders')
+        .update({
+          // status: 'pending', // <--- PREVENT RELEASE UNTIL ROUTE COMPLETION
+          return_flag: true,
+          last_return_reason: data.return_reason || null,
+          last_return_notes: data.observations || null,
+        })
+        .eq('id', order_id);
+      if (orderError2) console.warn('Failed to update order status:', orderError2);
+    }
+
+    await this.logSyncAction('delivery_confirmation', order_id, action, user_id);
+  }
+
+  private async syncReturnRevert(data: any): Promise<void> {
+    const { order_id, route_id } = data;
+    const { error } = await supabase
+      .from('route_orders')
+      .update({
+        status: 'pending',
+        returned_at: null,
+        return_reason: null,
+        return_notes: null,
+      })
+      .eq('order_id', order_id)
+      .eq('route_id', route_id);
+
+    if (error) {
+      throw new Error(`Failed to update route order: ${error.message}`);
+    }
+
+    const { error: orderError } = await supabase
+      .from('orders')
+      .update({
+        status: 'assigned', // LOCK: Back to 'assigned' (safe)
+        return_flag: false,
+        last_return_reason: null,
+        last_return_notes: null,
+      })
+      .eq('id', order_id);
+    if (orderError) console.warn('Failed to update order status on revert:', orderError);
+
+    await this.logSyncAction('return_revert', order_id, 'pending', data.user_id || null);
+  }
+
+  private async syncDeliveryRevert(data: any): Promise<void> {
+    const { order_id, route_id } = data;
+    const { error } = await supabase
+      .from('route_orders')
+      .update({
+        status: 'pending',
+        delivered_at: null,
+        signature_url: null,
+      })
+      .eq('order_id', order_id)
+      .eq('route_id', route_id);
+
+    if (error) {
+      throw new Error(`Failed to revert delivery: ${error.message}`);
+    }
+
+    const { error: orderError } = await supabase
+      .from('orders')
+      .update({
+        status: 'assigned', // LOCK: Back to 'assigned' (safe)
+        return_flag: false,
+      })
+      .eq('id', order_id);
+    if (orderError) console.warn('Failed to update order status on revert:', orderError);
+
+    await this.logSyncAction('delivery_revert', order_id, 'pending', data.user_id || null);
+  }
+
+  private async syncOrderUpdate(data: any): Promise<void> {
+    // Implement order update sync logic if needed
+    console.log('Syncing order update:', data);
+  }
+
+  private async syncAssemblyUndo(data: any): Promise<void> {
+    const { item_id, local_timestamp } = data;
+    if (!item_id) throw new Error('Invalid assembly_undo payload');
+
+    console.log('[BackgroundSync] syncAssemblyUndo:', item_id);
+
+    // 1. Fetch current status to check if we are undoing a return
+    const { data: current } = await supabase.from('assembly_products').select('status, order_id, product_sku, observations').eq('id', item_id).single();
+
+    if (current && current.status === 'cancelled') {
+      try {
+        // Clean up ghost
+        let query = supabase
+          .from('assembly_products')
+          .select('id')
+          .eq('order_id', current.order_id)
+          .eq('status', 'pending')
+          .eq('was_returned', true)
+          .is('assembly_route_id', null)
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (current.product_sku) query = query.eq('product_sku', current.product_sku);
+
+        const { data: ghosts } = await query;
+        if (ghosts && ghosts.length > 0) {
+          await supabase.from('assembly_products').delete().eq('id', ghosts[0].id);
+          console.log('[BackgroundSync] Deleted ghost copy for undo');
+        }
+      } catch (e) {
+        console.error('[BackgroundSync] Error cleaning ghost:', e);
+      }
+    }
+
+    // 2. Revert status
+    // Note: We use db current observations to clean strings, or default to whatever logic needed.
+    // Ideally we assume current.observations is up to date relative to when action was queued? 
+    // Actually the queue data usually doesn't contain full observations string, so we must use DB value.
+    const obs = current?.observations || '';
+    const cleanObs = obs.replace(/\(Retorno: .*\)\s*/, '').replace(/^Retorno: .*/, '').trim();
+
+    const { error } = await supabase
+      .from('assembly_products')
+      .update({
+        status: 'pending',
+        completion_date: null,
+        observations: cleanObs || null
+      })
+      .eq('id', item_id);
+
+    if (error) throw error;
+  }
+
+  private async logSyncAction(
+    entity: string,
+    entityId: string,
+    action: string,
+    userId: string
+  ): Promise<void> {
+    try {
+      const { error } = await supabase.from('sync_logs').insert({
+        entity,
+        entity_id: entityId,
+        action,
+        user_id: userId,
+        timestamp: new Date().toISOString(),
+      });
+
+      if (error) {
+        console.error('Failed to log sync action:', error);
+      }
+    } catch (error) {
+      console.error('Error logging sync action:', error);
+    }
+  }
+
+  private async logSyncError(item: any, error: Error): Promise<void> {
+    try {
+      await supabase.from('sync_logs').insert({
+        table_name: 'assembly_items', // Generic name or item.type
+        record_id: item.data?.item_id || item.id,
+        action: 'sync_failed',
+        data: {
+          error: error.message,
+          error_stack: error.stack,
+          item_type: item.type,
+          item_data: item.data
+        },
+        created_at: new Date().toISOString(),
+      });
+    } catch (logError) {
+      console.error('Failed to log sync error:', logError);
+    }
+  }
+
+
+
+  public getSyncStatus(): { isSyncing: boolean; isOnline: boolean } {
+    return {
+      isSyncing: this.isSyncing,
+      isOnline: NetworkStatus.isOnline(),
+    };
+  }
+}
+
+// Export singleton instance
+export const backgroundSync = BackgroundSyncService.getInstance();

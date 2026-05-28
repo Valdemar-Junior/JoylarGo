@@ -1,0 +1,3953 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { supabase } from '../../supabase/client';
+import type { AssemblyRoute, AssemblyProductWithDetails, DeliveryRouteCatalog, User, Vehicle } from '../../types/database';
+import DatePicker, { registerLocale } from 'react-datepicker';
+import { ptBR } from 'date-fns/locale';
+import {
+  ArrowLeft,
+  Plus,
+  Calendar,
+  User as UserIcon,
+  MapPin,
+  Package,
+  CheckCircle,
+  Clock,
+  AlertCircle,
+  Filter,
+  FileText,
+  Truck,
+  X,
+  Edit,
+  Trash2,
+  Settings,
+  Search,
+  RefreshCcw,
+  CheckCircle2,
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  Eye,
+  MessageSquare,
+  Zap,
+  Hammer,
+  ClipboardList,
+  ClipboardCheck,
+  Pencil,
+  Save,
+  FilePlus,
+  RefreshCw,
+  Wrench,
+  Loader2,
+  FileSpreadsheet,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown
+} from 'lucide-react';
+import { toast } from 'sonner';
+import { DeliverySheetGenerator } from '../../utils/pdf/deliverySheetGenerator';
+import { AssemblyReportGenerator } from '../../utils/pdf/assemblyReportGenerator';
+import { useAssemblyDataStore } from '../../stores/assemblyDataStore';
+import { useAuthStore } from '../../stores/authStore';
+import { saveUserPreference, loadUserPreference, mergeColumnsConfig, type ColumnConfig } from '../../utils/userPreferences';
+import { MultiSelect } from '../../components/ui/MultiSelect';
+import { calculateAssemblyStats } from '../../utils/assemblyKitLogic';
+
+registerLocale('pt-BR', ptBR);
+
+// --- ERROR BOUNDARY ---
+class AssemblyManagementErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('AssemblyManagement Error:', error, errorInfo);
+  }
+
+  handleReset = () => {
+    try {
+      localStorage.removeItem('am_columns_conf');
+      localStorage.removeItem('am_showCreateModal');
+      window.location.reload();
+    } catch (e) {
+      console.error('Failed to clear storage', e);
+      window.location.reload();
+    }
+  };
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex flex-col items-center justify-center bg-gray-50 p-4">
+          <div className="bg-white rounded-xl shadow-lg p-8 max-w-md w-full text-center">
+            <div className="mx-auto w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mb-6">
+              <AlertTriangle className="h-8 w-8 text-red-600" />
+            </div>
+            <h2 className="text-xl font-bold text-gray-900 mb-2">Ops! Algo deu errado.</h2>
+            <p className="text-gray-500 mb-6">
+              Ocorreu um erro ao carregar a tela de montagem. Isso geralmente acontece devido a uma configuração antiga salva no navegador.
+            </p>
+            <div className="bg-red-50 p-3 rounded-lg text-left text-xs font-mono text-red-700 mb-6 overflow-auto max-h-32">
+              {this.state.error?.message || 'Erro desconhecido'}
+            </div>
+            <button
+              onClick={this.handleReset}
+              className="w-full flex items-center justify-center px-4 py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition-colors shadow-sm"
+            >
+              <RefreshCcw className="h-4 w-4 mr-2" />
+              Limpar Configurações e Recarregar
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+function AssemblyManagementContent() {
+  const navigate = useNavigate();
+  const { user: authUser } = useAuthStore();
+
+  // --- LOCAL STATE ---
+  const [assemblyRoutes, setAssemblyRoutes] = useState<AssemblyRoute[]>([]);
+  const [assemblyProducts, setAssemblyProducts] = useState<AssemblyProductWithDetails[]>([]);
+  const [assemblyPending, setAssemblyPending] = useState<AssemblyProductWithDetails[]>([]);
+  const [assemblyInRoutes, setAssemblyInRoutes] = useState<AssemblyProductWithDetails[]>([]);
+  const [montadores, setMontadores] = useState<User[]>([]);
+  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
+  const [deliveryRouteCatalog, setDeliveryRouteCatalog] = useState<DeliveryRouteCatalog[]>([]);
+
+  // Selection
+  const [selectedOrders, setSelectedOrders] = useState<Set<string>>(new Set());
+
+  // New Route Form
+  const [selectedDeliveryRouteId, setSelectedDeliveryRouteId] = useState<string>('');
+  const [selectedMontador, setSelectedMontador] = useState<string>('');
+  const [selectedVehicle, setSelectedVehicle] = useState<string>('');
+  const [observations, setObservations] = useState<string>('');
+  const [deadline, setDeadline] = useState<string>('');
+  const [selectedExistingRoute, setSelectedExistingRoute] = useState<string>(''); // '' = criar nova, route_id = adicionar a existente
+
+  // UI States
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  // Modals
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showColumnsModal, setShowColumnsModal] = useState(false);
+  const [selectedRoute, setSelectedRoute] = useState<AssemblyRoute | null>(null);
+  const [showRouteModal, setShowRouteModal] = useState(false);
+  const [showOrderProductsModal, setShowOrderProductsModal] = useState(false);
+  const [orderProductsModal, setOrderProductsModal] = useState<{ orderId: string; products: AssemblyProductWithDetails[] } | null>(null);
+  const [waSending, setWaSending] = useState(false);
+  const [groupSending, setGroupSending] = useState(false);
+  const [startingRoute, setStartingRoute] = useState(false);
+  // Edit route states
+  const [isEditingRoute, setIsEditingRoute] = useState(false);
+  const [editSelectedDeliveryRouteId, setEditSelectedDeliveryRouteId] = useState('');
+  const [editRouteMontador, setEditRouteMontador] = useState('');
+  const [editRouteVehicle, setEditRouteVehicle] = useState('');
+  const [editRouteDeadline, setEditRouteDeadline] = useState('');
+  const [editRouteObservations, setEditRouteObservations] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+  // Add orders to route states
+  const [showAddOrdersModal, setShowAddOrdersModal] = useState(false);
+  const [ordersToAdd, setOrdersToAdd] = useState<Set<string>>(new Set());
+  const [addingOrders, setAddingOrders] = useState(false);
+  const [ordersPage, setOrdersPage] = useState(1);
+  const [ordersPageSize, setOrdersPageSize] = useState(200);
+  const isLoadingRef = useRef(false);
+  const isMountedRef = useRef(true);
+  const [deliveryInfo, setDeliveryInfo] = useState<Record<string, string>>({});
+
+  // Sorting State
+  const [sortColumn, setSortColumn] = useState<string | null>(null);
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('asc');
+
+  // Realtime Refs (to access latest function version inside effect)
+  const fetchRoutesRef = useRef<any>(null);
+  const loadDataRef = useRef<any>(null);
+  const assemblyRoutesRef = useRef<AssemblyRoute[]>([]); // To pass current routes to loadData on product updates
+
+  // --- SINGLE LAUNCH IMPORT (TROCAS/ASSISTENCIAS/VENDAS) ---
+  const [showLaunchModal, setShowLaunchModal] = useState(false);
+  const [launchNumber, setLaunchNumber] = useState('');
+  const [launchType, setLaunchType] = useState<'troca' | 'assistencia' | 'venda'>('troca');
+  const [launchLoading, setLaunchLoading] = useState(false);
+  const [launchPreviewData, setLaunchPreviewData] = useState<any[] | null>(null); // New: Store fetched data for preview
+  const [selectedPreviewIndices, setSelectedPreviewIndices] = useState<Set<string>>(new Set()); // New: Track selected products
+  const [launchObservation, setLaunchObservation] = useState(''); // Observação interna editável na importação avulsa
+
+  // --- PDF SORT OPTIONS MODAL ---
+  const [showPdfSortModal, setShowPdfSortModal] = useState(false);
+  const [pdfSortOption, setPdfSortOption] = useState<'data_venda' | 'cidade' | 'previsao_montagem' | 'cliente'>('data_venda');
+
+
+  // Filters
+  const [filterCity, setFilterCity] = useState<string[]>([]);
+  const [filterNeighborhood, setFilterNeighborhood] = useState<string[]>([]);
+  const [filterDeadline, setFilterDeadline] = useState<'all' | 'within' | 'out'>('all');
+  const [filterOrder, setFilterOrder] = useState<string>('');
+  const [filterClient, setFilterClient] = useState<string>('');
+
+  // Date Range Filters
+  const [filterSaleDateStart, setFilterSaleDateStart] = useState<string>('');
+  const [filterSaleDateEnd, setFilterSaleDateEnd] = useState<string>('');
+
+  const [filterDeliveryDateStart, setFilterDeliveryDateStart] = useState<string>('');
+  const [filterDeliveryDateEnd, setFilterDeliveryDateEnd] = useState<string>('');
+
+  const [filterForecastDateStart, setFilterForecastDateStart] = useState<string>('');
+  const [filterForecastDateEnd, setFilterForecastDateEnd] = useState<string>('');
+
+  const [filterReturned, setFilterReturned] = useState<boolean>(false);
+  const [filterFull, setFilterFull] = useState<boolean>(false);
+  const [filterServiceType, setFilterServiceType] = useState<string>('');
+
+  // --- NEW FILTERS (Replicated from Delivery) ---
+  const [filterFilialVenda, setFilterFilialVenda] = useState<string>('');
+  const [filterLocalEstocagem, setFilterLocalEstocagem] = useState<string>('');
+  const [strictLocal, setStrictLocal] = useState<boolean>(false);
+  const [filterSeller, setFilterSeller] = useState<string>('');
+  const [filterOperation, setFilterOperation] = useState<string>('');
+  const [filterBrand, setFilterBrand] = useState<string>('');
+  const [filterFreightFull, setFilterFreightFull] = useState<string>('');
+  const [filterHasAssembly, setFilterHasAssembly] = useState<boolean>(false);
+  const [strictDepartment, setStrictDepartment] = useState<boolean>(false);
+
+  const [showFilters, setShowFilters] = useState(true);
+
+  // PAGINATION & ROUTE FILTERS STATE
+  const [dateFilter, setDateFilter] = useState<'today' | 'yesterday' | 'last7' | 'all'>('today');
+  const [statusFilter, setStatusFilter] = useState<string[]>([]);
+  const [routeSearchQuery, setRouteSearchQuery] = useState<string>(''); // New Search State
+  const [page, setPage] = useState(0);
+  const [hasMoreRoutes, setHasMoreRoutes] = useState(true);
+  const LIMIT = 50;
+  // Unfiltered routes for the dropdown
+  const [allPendingRoutes, setAllPendingRoutes] = useState<AssemblyRoute[]>([]);
+  const [loadingAllPending, setLoadingAllPending] = useState(false);
+
+  // Table Config
+  const [columnsConf, setColumnsConf] = useState<Array<{ id: string, label: string, visible: boolean }>>([
+    { id: 'dataVenda', label: 'Data Venda', visible: true },
+    { id: 'entrega', label: 'Entrega', visible: true },
+    { id: 'previsao', label: 'Previsão', visible: true },
+    { id: 'pedido', label: 'Pedido', visible: true },
+    { id: 'cliente', label: 'Cliente', visible: true },
+    { id: 'telefone', label: 'Telefone', visible: true },
+    { id: 'sinais', label: 'Sinais', visible: true },
+    { id: 'produto', label: 'Produto', visible: true },
+    { id: 'sku', label: 'SKU', visible: true },
+    { id: 'obsPublicas', label: 'Obs. Públicas', visible: true },
+    { id: 'obsInternas', label: 'Obs. Internas', visible: true },
+    { id: 'cidade', label: 'Cidade', visible: true },
+    { id: 'bairro', label: 'Bairro', visible: true },
+    { id: 'endereco', label: 'Endereço', visible: true },
+    { id: 'department', label: 'Departamento', visible: true },
+    { id: 'subgroup', label: 'Subgrupo', visible: true },
+  ]);
+
+  const ordersSectionRef = useRef<HTMLDivElement>(null);
+  const routesSectionRef = useRef<HTMLDivElement>(null);
+
+  // Drag logic
+  const productsScrollRef = useRef<HTMLDivElement>(null);
+  const [draggingProducts, setDraggingProducts] = useState(false);
+  const dragStartXRef = useRef(0);
+  const dragScrollLeftRef = useRef(0);
+
+  const onProductsMouseDown = (e: any) => {
+    if (!productsScrollRef.current) return;
+    setDraggingProducts(true);
+    dragStartXRef.current = e.clientX;
+    dragScrollLeftRef.current = productsScrollRef.current.scrollLeft;
+  };
+
+  const onProductsMouseMove = (e: any) => {
+    if (!draggingProducts || !productsScrollRef.current) return;
+    const dx = e.clientX - dragStartXRef.current;
+    productsScrollRef.current.scrollLeft = dragScrollLeftRef.current - dx;
+  };
+
+  const endProductsDrag = () => { setDraggingProducts(false); };
+
+  const scrollToSection = (ref: React.RefObject<HTMLElement>) => {
+    if (ref.current) {
+      ref.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
+
+
+  // Restore persisted selections and scroll position
+  useEffect(() => {
+    const loadColumnsFromSupabase = async () => {
+      const defaults: ColumnConfig[] = [
+        { id: 'dataVenda', label: 'Data Venda', visible: true },
+        { id: 'entrega', label: 'Entrega', visible: true },
+        { id: 'previsao', label: 'Previsão', visible: true },
+        { id: 'pedido', label: 'Pedido', visible: true },
+        { id: 'cliente', label: 'Cliente', visible: true },
+        { id: 'telefone', label: 'Telefone', visible: true },
+        { id: 'sinais', label: 'Sinais', visible: true },
+        { id: 'produto', label: 'Produto', visible: true },
+        { id: 'sku', label: 'SKU', visible: true },
+        { id: 'obsPublicas', label: 'Obs. Públicas', visible: true },
+        { id: 'obsInternas', label: 'Obs. Internas', visible: true },
+        { id: 'cidade', label: 'Cidade', visible: true },
+        { id: 'bairro', label: 'Bairro', visible: true },
+        { id: 'endereco', label: 'Endereço', visible: true },
+        { id: 'department', label: 'Departamento', visible: true },
+        { id: 'subgroup', label: 'Subgrupo', visible: true },
+      ];
+
+      try {
+        // Load columns config from Supabase (or localStorage fallback)
+        if (authUser?.id) {
+          const savedCols = await loadUserPreference<ColumnConfig[]>(authUser.id, 'am_columns_conf');
+          if (savedCols) {
+            const merged = mergeColumnsConfig(savedCols, defaults);
+            setColumnsConf(merged);
+          }
+        } else {
+          // Fallback to localStorage if not authenticated
+          const cols = localStorage.getItem('am_columns_conf');
+          if (cols) {
+            const parsed = JSON.parse(cols);
+            if (Array.isArray(parsed)) {
+              const merged = mergeColumnsConfig(parsed, defaults);
+              setColumnsConf(merged);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[AssemblyManagement] Error loading columns config:', e);
+      }
+    };
+
+    loadColumnsFromSupabase();
+  }, [authUser?.id]);
+
+  // NOTE: States like selectedOrders, selectedRoute, showCreateModal, showRouteModal
+  // are intentionally NOT restored from localStorage on component mount.
+  // User requested: when entering the screen, nothing should be pre-selected or pre-opened.
+
+  // We still persist selectedOrders for in-session use (e.g., if user switches tabs within the app)
+  // but DO NOT restore on fresh page load. The useEffect below only saves, not restores.
+
+  useEffect(() => {
+    try { localStorage.setItem('am_selectedOrders', JSON.stringify(Array.from(selectedOrders))); } catch { }
+  }, [selectedOrders]);
+
+  const onProductsScroll = () => {
+    try { if (productsScrollRef.current) localStorage.setItem('am_productsScrollLeft', String(productsScrollRef.current.scrollLeft || 0)); } catch { }
+  };
+
+  // Persist filters across refresh/tab switch
+  useEffect(() => {
+    try {
+      const data = localStorage.getItem('am_filters');
+      if (data) {
+        const f = JSON.parse(data);
+        if (f && typeof f === 'object') {
+          if ('city' in f) {
+            const val = f.city;
+            setFilterCity(Array.isArray(val) ? val : (val ? [val] : []));
+          }
+          if ('neighborhood' in f) {
+            const val = f.neighborhood;
+            setFilterNeighborhood(Array.isArray(val) ? val : (val ? [val] : []));
+          }
+          if ('deadline' in f) setFilterDeadline(f.deadline || 'all');
+          if ('order' in f) setFilterOrder(f.order || '');
+          if ('client' in f) setFilterClient(f.client || '');
+          // Dates are usually not persisted as they might be transient, but user asked for these filters. 
+          // Persisting might be annoying if they come back next day and don't see anything.
+          // Let's persist them for now as per pattern, but user can clear.
+          if ('saleDateStart' in f) setFilterSaleDateStart(f.saleDateStart || '');
+          if ('saleDateEnd' in f) setFilterSaleDateEnd(f.saleDateEnd || '');
+
+          if ('deliveryDateStart' in f) setFilterDeliveryDateStart(f.deliveryDateStart || '');
+          if ('deliveryDateEnd' in f) setFilterDeliveryDateEnd(f.deliveryDateEnd || '');
+
+          if ('forecastDateStart' in f) setFilterForecastDateStart(f.forecastDateStart || '');
+          if ('forecastDateEnd' in f) setFilterForecastDateEnd(f.forecastDateEnd || '');
+          if ('returned' in f) setFilterReturned(Boolean(f.returned));
+          if ('full' in f) setFilterFull(Boolean(f.full));
+          if ('serviceType' in f) setFilterServiceType(f.serviceType || '');
+        }
+      }
+    } catch { }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const payload = {
+        city: filterCity,
+        neighborhood: filterNeighborhood,
+        deadline: filterDeadline,
+        order: filterOrder,
+        client: filterClient,
+        saleDateStart: filterSaleDateStart,
+        saleDateEnd: filterSaleDateEnd,
+        deliveryDateStart: filterDeliveryDateStart,
+        deliveryDateEnd: filterDeliveryDateEnd,
+        forecastDateStart: filterForecastDateStart,
+        forecastDateEnd: filterForecastDateEnd,
+        returned: filterReturned,
+        full: filterFull,
+        serviceType: filterServiceType,
+      };
+      localStorage.setItem('am_filters', JSON.stringify(payload));
+    } catch { }
+  }, [filterCity, filterNeighborhood, filterDeadline, filterOrder, filterClient, filterSaleDateStart, filterSaleDateEnd, filterDeliveryDateStart, filterDeliveryDateEnd, filterForecastDateStart, filterForecastDateEnd, filterReturned, filterFull, filterServiceType]);
+
+  // --- MEMOS (Options) ---
+  const cityOptions = useMemo(() => {
+    const cities = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const city = ap.order?.address_json?.city;
+      if (city) cities.add(city);
+    });
+    return Array.from(cities).sort();
+  }, [assemblyPending]);
+
+  const neighborhoodOptions = useMemo(() => {
+    const neighborhoods = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const city = ap.order?.address_json?.city;
+      const neighborhood = ap.order?.address_json?.neighborhood;
+
+      // If cities are selected, only show neighborhoods from those cities
+      if (filterCity.length > 0) {
+        if (city && filterCity.includes(city) && neighborhood) {
+          neighborhoods.add(neighborhood);
+        }
+      } else {
+        // Otherwise show all
+        if (neighborhood) neighborhoods.add(neighborhood);
+      }
+    });
+    return Array.from(neighborhoods).sort();
+  }, [assemblyPending, filterCity]);
+
+  // --- NEW: Group/Subgroup Options Logic ---
+  const [filterDepartment, setFilterDepartment] = useState<string[]>([]);
+  const [filterSubgroup, setFilterSubgroup] = useState<string[]>([]);
+
+  const departmentOptions = useMemo(() => {
+    const depts = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const d = ap.order?.product_group || ap.order?.department;
+      if (d) depts.add(d);
+    });
+    return Array.from(depts).sort();
+  }, [assemblyPending]);
+
+  const subgroupOptions = useMemo(() => {
+    const subs = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const dept = ap.order?.product_group || ap.order?.department;
+      const sub = ap.order?.product_subgroup;
+
+      if (!sub) return;
+      if (filterDepartment.length > 0) {
+        if (dept && filterDepartment.includes(dept)) {
+          subs.add(sub);
+        }
+      } else {
+        subs.add(sub);
+      }
+    });
+    return Array.from(subs).sort();
+  }, [assemblyPending, filterDepartment]);
+
+  // --- NEW OPTIONS MEMOS ---
+  const filialOptions = useMemo(() => {
+    const s = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const f = ap.order?.raw_json?.filial_venda || ap.order?.filial_venda;
+      if (f) s.add(f);
+    });
+    return Array.from(s).sort();
+  }, [assemblyPending]);
+
+  const localOptions = useMemo(() => {
+    const s = new Set<string>();
+    assemblyPending.forEach(ap => {
+      // Assuming location might be on the item (assembly_product acts as item here somewhat)
+      // The assembly_product table doesn't have 'location' explicitly in the selected fields commonly, 
+      // but let's check if we can derive it or if we need to add it to the select.
+      // Ideally we should check 'location' in items_json of the order if we want strict accuracy,
+      // but assembly_product might not have it directly. 
+      // For now, let's look at order field if exists or skip.
+      // Warning: 'location' is usually on the item level. 
+      // If we don't have it, we skip.
+    });
+    return []; // Placeholder until we confirm location source
+  }, [assemblyPending]);
+
+  const sellerOptions = useMemo(() => {
+    const s = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const seller = ap.order?.raw_json?.vendedor || ap.order?.raw_json?.nome_vendedor || '';
+      if (seller) s.add(seller);
+    });
+    return Array.from(s).sort();
+  }, [assemblyPending]);
+
+  const operationOptions = useMemo(() => {
+    const s = new Set<string>();
+    assemblyPending.forEach(ap => {
+      const op = ap.order?.raw_json?.operacoes;
+      if (op) s.add(op);
+    });
+    return Array.from(s).sort();
+  }, [assemblyPending]);
+
+  const brandOptions = useMemo(() => {
+    const s = new Set<string>();
+    assemblyPending.forEach(ap => {
+      // Brand is usually on item.
+      // We'll skip for now or assume it's not critical if data missing.
+    });
+    return [];
+  }, [assemblyPending]);
+
+
+  // --- HELPERS ---
+  const formatDate = (dateStr: string | null | undefined) => {
+    if (!dateStr) return '-';
+    try {
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return '-';
+      return d.toLocaleDateString('pt-BR');
+    } catch {
+      return '-';
+    }
+  };
+
+  const getMontadorLabelById = (assemblerId: string | undefined) => {
+    if (!assemblerId) return 'Sem montador';
+    const montador = montadores.find(m => String(m.id) === String(assemblerId));
+    return montador?.name || montador?.email || 'Sem montador';
+  };
+
+  const getExistingRouteOptionLabel = (route: AssemblyRoute) => {
+    const routeCode = String((route as any).route_code || '').trim();
+    const montadorLabel = getMontadorLabelById((route as any).assembler_id);
+    const createdAtLabel = formatDate(route.created_at);
+    const parts = [route.name];
+
+    if (routeCode) parts.push(routeCode);
+    parts.push(montadorLabel);
+    if (createdAtLabel !== '-') parts.push(createdAtLabel);
+
+    return parts.join(' | ');
+  };
+
+  const parseDateSafe = (input: any): Date | null => {
+    if (!input) return null;
+    try { const d = new Date(String(input)); return isNaN(d.getTime()) ? null : d; } catch { return null; }
+  };
+
+  // Helper to convert YYYY-MM-DD string to Date object (local time)
+  // We append T12:00:00 to avoid timezone issues shifting the day
+  const stringToDate = (str: string): Date | null => {
+    if (!str) return null;
+    try {
+      const [y, m, d] = str.split('-').map(Number);
+      return new Date(y, m - 1, d);
+    } catch { return null; }
+  };
+
+  // Helper to convert Date object to YYYY-MM-DD string
+  const dateToString = (date: Date | null): string => {
+    if (!date) return '';
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  };
+
+  const getPrevisaoMontagemValue = (order: any): string => {
+    const raw: any = order?.raw_json || {};
+    return order?.previsao_montagem || raw?.previsao_montagem || '';
+  };
+
+  const getPrevisaoMontagem = (order: any): Date | null => {
+    return parseDateSafe(getPrevisaoMontagemValue(order));
+  };
+
+  const getPrazoStatusForOrder = (o: any): 'within' | 'out' | 'none' => {
+    const prev = getPrevisaoMontagem(o);
+    if (!prev) return 'none';
+    const today = new Date();
+    const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    const prevStart = new Date(prev.getFullYear(), prev.getMonth(), prev.getDate());
+    return todayStart.getTime() <= prevStart.getTime() ? 'within' : 'out';
+  };
+
+  // --- ROUTE FETCHING ---
+  const fetchAssemblyRoutes = async (resetPage: boolean = false, search: string = '') => {
+    try {
+      const currentPage = resetPage ? 0 : page;
+      const from = currentPage * LIMIT;
+      const to = from + LIMIT - 1;
+
+      console.log(`Fetching assembly routes page ${currentPage} (${from}-${to}) with filter ${dateFilter} search="${search}"`);
+
+      let query = supabase
+        .from('assembly_routes')
+        .select('*', { count: 'exact' })
+        .order('created_at', { ascending: false });
+
+      // Apply Search (Server Side)
+      if (search) {
+        // Filter by name OR route_code
+        query = query.or(`name.ilike.%${search}%,route_code.ilike.%${search}%`);
+      }
+
+      // Apply Date Filters (Only if NO search or if we want to combine)
+      // Usually user expects search to override date filters if they are searching for a specific old route.
+      // But standard UI keeps filters active. Let's keep them active UNLESS it confuses users.
+      // Delivery Management behavior: Search filters WITHIN the current view? 
+      // User complaint: "se essa rota não tiver dentros das 50 não carreega". 
+      // If we apply search, we should probably RELAX date filters if the user wants to find *any* route.
+      // HOWEVER, if the user has "Today" selected and searches "Route X" (from last month), they might expect it to show up.
+      // Fix: If search is present, we IGNORE date filters to allow global search.
+      if (!search) {
+        const now = new Date();
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+
+        if (dateFilter === 'today') {
+          query = query.gte('created_at', todayStart);
+        } else if (dateFilter === 'yesterday') {
+          const yesterday = new Date(now);
+          yesterday.setDate(yesterday.getDate() - 1);
+          const yesterdayStart = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate()).toISOString();
+          query = query.gte('created_at', yesterdayStart).lt('created_at', todayStart);
+        } else if (dateFilter === 'last7') {
+          const last7 = new Date(now);
+          last7.setDate(last7.getDate() - 7);
+          const last7Start = new Date(last7.getFullYear(), last7.getMonth(), last7.getDate()).toISOString();
+          query = query.gte('created_at', last7Start);
+        }
+      }
+
+      // Apply Status Filters (Keep these even with search? Probably yes, or no?)
+      // Use case: Search for "Route X" but it's completed, and I have "Pending" selected. Result: Empty.
+      // This is often confusing. Better to clear other filters or ignore them when searching.
+      // Let's IGNORE status filter if searching too, for maximum "Findability".
+      if (!search && statusFilter.length > 0) {
+        query = query.in('status', statusFilter);
+      }
+
+      // Pagination
+      query = query.range(from, to);
+
+      const { data, error, count } = await query;
+
+      if (error) throw error;
+
+      const fetchedRoutes = data || [];
+
+      if (resetPage) {
+        setAssemblyRoutes(fetchedRoutes);
+      } else {
+        setAssemblyRoutes(prev => [...prev, ...fetchedRoutes]);
+      }
+
+      setHasMoreRoutes((data?.length || 0) === LIMIT);
+      if (resetPage) setPage(1); // Next page
+      else setPage(prev => prev + 1);
+
+      // Update ref for Realtime usage
+      if (resetPage) assemblyRoutesRef.current = fetchedRoutes;
+      else assemblyRoutesRef.current = [...assemblyRoutesRef.current, ...fetchedRoutes];
+
+      return fetchedRoutes;
+
+    } catch (err) {
+      console.error('Error fetching assembly routes:', err);
+      toast.error('Erro ao buscar rotas de montagem');
+      return [];
+    }
+  };
+
+  // Fetch ALL pending routes for the dropdown (ignoring page filters)
+  const fetchAllPendingRoutes = async () => {
+    setLoadingAllPending(true);
+    try {
+      const { data, error } = await supabase
+        .from('assembly_routes')
+        .select('*')
+        .select('*')
+        .in('status', ['pending', 'in_progress'])
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      setAllPendingRoutes(data || []);
+    } catch (err) {
+      console.error('Error fetching all pending routes:', err);
+      toast.error('Erro ao atualizar lista de rotas de montagem');
+    } finally {
+      setLoadingAllPending(false);
+    }
+  };
+
+  const fetchDeliveryRouteCatalog = async (): Promise<DeliveryRouteCatalog[]> => {
+    try {
+      const { data, error } = await supabase
+        .from('delivery_route_catalog')
+        .select('id, name, active, created_at, updated_at')
+        .eq('active', true)
+        .order('name');
+
+      if (error) throw error;
+      const catalog = (data || []) as DeliveryRouteCatalog[];
+      setDeliveryRouteCatalog(catalog);
+      return catalog;
+    } catch (err) {
+      console.error('Error fetching delivery route catalog:', err);
+      toast.error('Erro ao carregar rotas padronizadas');
+      return [];
+    }
+  };
+
+  // --- DATA LOADING ---
+  const loadData = async (silent: boolean = true, currentRoutes: any[] = []) => {
+    try {
+      // Removed isLoadingRef check to allow re-entrant calls from effect chains
+      // if (isLoadingRef.current) return;
+      isLoadingRef.current = true;
+      if (!silent) setLoading(true);
+
+      // Load assembly routes (Optimized)
+      // NOTE: If currentRoutes was passed as parameter, use that. Otherwise fetch if !silent.
+      let routesForQuery: AssemblyRoute[] = currentRoutes as AssemblyRoute[];
+      if (!silent && routesForQuery.length === 0) {
+        const res = await fetchAssemblyRoutes(true, routeSearchQuery);
+        routesForQuery = res;
+      }
+
+      // Load assembly products (split queries for performance)
+      const { data: productsPending } = await supabase
+        .from('assembly_products')
+        .select(`
+          id, order_id, product_name, product_sku, status, assembly_route_id, created_at, updated_at, was_returned, observations, returned_at,
+          order:order_id!inner (id, order_id_erp, customer_name, phone, address_json, raw_json, data_venda, previsao_entrega, previsao_montagem, observacoes_publicas, observacoes_internas, status, service_type, tem_frete_full, department, product_group, product_subgroup),
+          installer:installer_id (id, name)
+        `)
+        .is('assembly_route_id', null)
+        .eq('status', 'pending');
+
+      // Trace removed
+
+
+      let productsInRoutes: any[] = [];
+      try {
+        // Fix: Always use routesForQuery if provided and valid, regardless of silent flag
+        // This ensures that when we fetch routes and pass them to loadData, they are actually used
+        const routesToCheck = (routesForQuery && routesForQuery.length > 0) ? routesForQuery : assemblyRoutes;
+
+        const routeIds = Array.from(new Set((routesToCheck || []).map((r: any) => r.id))).filter(Boolean);
+        if (routeIds.length > 0) {
+          const { data: productsR } = await supabase
+            .from('assembly_products')
+            .select(`
+              id, order_id, product_name, product_sku, status, assembly_route_id, created_at, updated_at, was_returned, completion_date, returned_at, observations,
+              order:order_id (id, order_id_erp, customer_name, phone, address_json, raw_json, items_json, data_venda, previsao_entrega, previsao_montagem, department, product_group, product_subgroup),
+              installer:installer_id (id, name)
+            `)
+            .in('assembly_route_id', routeIds);
+          productsInRoutes = productsR || [];
+
+
+        }
+      } catch { }
+
+      // Load montadores
+      const { data: montadoresData } = await supabase
+        .from('users')
+        .select('*')
+        .eq('role', 'montador');
+
+      // Load vehicles
+      const { data: vehiclesData } = await supabase
+        .from('vehicles')
+        .select('*')
+        .eq('active', true);
+
+      // Always set state - React handles unmounted components internally
+      // Note: setAssemblyRoutes is handled by fetchAssemblyRoutes if !silent
+      console.log('[AssemblyManagement] Setting state - pending products:', (productsPending || []).length);
+
+      setAssemblyProducts((productsPending || []) as any);
+      setAssemblyPending((productsPending || []) as any);
+      // Merge products: keep previously loaded products for routes not in current query
+      // This preserves products loaded via "Detalhes" button for routes outside date filter
+      setAssemblyInRoutes(prev => {
+        const newRouteIds = new Set((productsInRoutes || []).map((p: any) => String(p.assembly_route_id)));
+        const keepPrev = prev.filter(p => !newRouteIds.has(String(p.assembly_route_id)));
+        return [...keepPrev, ...(productsInRoutes || [])] as any;
+      });
+      setMontadores(montadoresData || []);
+      setVehicles(vehiclesData || []);
+
+      try {
+        const rid = localStorage.getItem('am_selectedRouteId');
+        const showPref = localStorage.getItem('am_showRouteModal');
+        // We use routesForQuery again for finding selected route
+        const routesAvailable = (routesForQuery.length > 0) ? routesForQuery : assemblyRoutes;
+
+        if (showPref === '1' && rid && isMountedRef.current) {
+          const found = (routesAvailable || []).find((r: any) => String(r.id) === String(rid));
+          if (found) {
+            setSelectedRoute(found);
+            setShowRouteModal(true);
+          }
+        }
+      } catch { }
+      try {
+        const orderIds = Array.from(new Set(((productsPending || []) as any[]).map((ap: any) => String(ap.order_id)).filter(Boolean)));
+        if (orderIds.length > 0) {
+          const { data: roDelivered } = await supabase
+            .from('route_orders')
+            .select('order_id, delivered_at, status')
+            .in('order_id', orderIds)
+            .eq('status', 'delivered');
+          const map: Record<string, string> = {};
+          (roDelivered || []).forEach((r: any) => { if (r.delivered_at) map[String(r.order_id)] = String(r.delivered_at); });
+          console.log('[AssemblyManagement] deliveryInfo map:', Object.keys(map).length, 'items, orderIds searched:', orderIds.length);
+          setDeliveryInfo(map);
+        } else {
+          setDeliveryInfo({});
+        }
+      } catch { }
+
+    } catch (error) {
+      console.error('Error loading data:', error);
+      toast.error('Erro ao carregar dados');
+    } finally {
+      setLoading(false);
+      isLoadingRef.current = false;
+    }
+  };
+
+  // --- EFFECTS ---
+
+  // Debounce for Search
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      // If we have a query, fetch with the query (resetting page)
+      // If query is empty, it falls back to standard filters.
+      const fetchedRoutes = await fetchAssemblyRoutes(true, routeSearchQuery);
+      // IMPORTANT: Also load products for the fetched routes
+      // This ensures routes found via search have their products loaded
+      if (fetchedRoutes && fetchedRoutes.length > 0) {
+        await loadData(true, fetchedRoutes);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [routeSearchQuery]);
+
+  useEffect(() => {
+    // Only load initial data if we haven't already (or let the debounce handle it?)
+    // Debounce handles the route fetching.
+    // loadData handles products.
+    // We should call loadData but avoid double fetching routes if possible.
+    // Actually, loadData triggers fetchAssemblyRoutes if active routes are empty.
+    // But debounce will also trigger it.
+    // Let's rely on standard loadData, but maybe pass empty to search initially?
+    loadData(true);
+
+    // Update refs for Realtime
+    fetchRoutesRef.current = fetchAssemblyRoutes;
+    loadDataRef.current = loadData;
+  }, []);
+
+  // Separate effect for auto-open logic
+  useEffect(() => {
+    const checkAutoOpen = async () => {
+      // Small delay to ensure initial load has started/stabilized
+      await new Promise(r => setTimeout(r, 500));
+
+      const autoOpenId = localStorage.getItem('am_selectedRouteId');
+      const shouldOpen = localStorage.getItem('am_showRouteModal');
+
+      if (autoOpenId && shouldOpen === '1') {
+        localStorage.removeItem('am_selectedRouteId');
+        localStorage.removeItem('am_showRouteModal');
+
+        const { data, error } = await supabase
+          .from('assembly_routes')
+          .select(`
+            *,
+            assembler:users!assembler_id(id, name),
+            vehicle:vehicles!vehicle_id(model, plate),
+            assembly_products(
+              *,
+              order:orders!order_id(
+                id,
+                order_id_erp,
+                customer_name,
+                customer_cpf,
+                phone,
+                address_json,
+                items_json
+              )
+            )
+          `)
+          .eq('id', autoOpenId)
+          .single();
+
+        if (!error && data) {
+          const formattedRoute: AssemblyRoute = {
+            ...data,
+            assembler_name: data.assembler?.name,
+            vehicle_model: data.vehicle?.model,
+            vehicle_plate: data.vehicle?.plate,
+            assembly_products: (data.assembly_products || []).map((ap: any) => ({
+              ...ap,
+              order_id_erp: ap.order?.order_id_erp,
+              customer_name: ap.order?.customer_name,
+              customer_address: ap.order?.address_json ?
+                `${ap.order.address_json.street || ''}, ${ap.order.address_json.neighborhood || ''} - ${ap.order.address_json.city || ''}` : '',
+              products: ap.order?.items_json || []
+            }))
+          };
+
+          // Safe update: Add these products to the global list without overwriting
+          setAssemblyInRoutes(prev => {
+            const others = prev.filter(p => p.assembly_route_id !== formattedRoute.id);
+            return [...others, ...(formattedRoute as any).assembly_products];
+          });
+
+          setSelectedRoute(formattedRoute);
+          setShowRouteModal(true);
+        }
+      }
+    };
+
+    checkAutoOpen();
+  }, []);
+
+  // Fetch all pending routes when modal opens
+  useEffect(() => {
+    if (showCreateModal) {
+      fetchAllPendingRoutes();
+      fetchDeliveryRouteCatalog();
+    }
+  }, [showCreateModal]);
+
+  // Realtime removido: assinaturas sem filtro em assembly_routes/assembly_products
+  // sobrecarregavam o pool de conexões do Supabase durante operações em lote.
+
+  useEffect(() => {
+    // This effect runs on mount and when filters change
+    // CHAINING CRITICAL: We must fetch routes first, THEN load products for those routes
+    fetchAssemblyRoutes(true).then((fetchedRoutes) => {
+      if (fetchedRoutes && fetchedRoutes.length > 0) {
+        loadData(true, fetchedRoutes);
+      } else {
+        loadData(true); // Load pending even if no routes
+      }
+    });
+  }, [dateFilter, statusFilter]);
+
+  // Removed: Duplicate mount-effect was racing with the filter-effect above.
+  // The filter-effect (which has [] dependency initially) already handles mount loading.
+  // This was causing the "Total=0" bug because this ran BEFORE routes were fetched.
+
+  const toggleOrderSelection = (orderId: string) => {
+    const newSelected = new Set(selectedOrders);
+    const wasSelected = newSelected.has(orderId);
+    if (wasSelected) {
+      newSelected.delete(orderId);
+    } else {
+      newSelected.add(orderId);
+    }
+    setSelectedOrders(newSelected);
+  };
+
+  // Generate unique route code: RM-DDMMYY-XXX for assembly routes
+  const generateRouteCode = async (): Promise<string> => {
+    const prefix = 'RM';
+    const now = new Date();
+    const day = String(now.getDate()).padStart(2, '0');
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const year = String(now.getFullYear()).slice(-2);
+    const dateCode = `${day}${month}${year}`;
+
+    // Query existing codes for today to get next sequence
+    const pattern = `${prefix}-${dateCode}-%`;
+    const { data: existingRoutes } = await supabase
+      .from('assembly_routes')
+      .select('route_code')
+      .like('route_code', pattern)
+      .order('route_code', { ascending: false })
+      .limit(1);
+
+    let nextSeq = 1;
+    if (existingRoutes && existingRoutes.length > 0 && existingRoutes[0].route_code) {
+      const lastCode = existingRoutes[0].route_code as string;
+      const lastSeq = parseInt(lastCode.split('-')[2], 10);
+      if (!isNaN(lastSeq)) {
+        nextSeq = lastSeq + 1;
+      }
+    }
+
+    return `${prefix}-${dateCode}-${String(nextSeq).padStart(3, '0')}`;
+  };
+
+  const createAssemblyRoute = async () => {
+    const selectedCatalogRouteName = deliveryRouteCatalog
+      .find((route) => String(route.id) === String(selectedDeliveryRouteId))
+      ?.name
+      ?.trim() || '';
+
+    // If creating new route, name is required
+    if (!selectedExistingRoute && !selectedCatalogRouteName) {
+      toast.error('Por favor, selecione uma rota de montagem cadastrada');
+      return;
+    }
+
+    if (selectedOrders.size === 0) {
+      toast.error('Por favor, selecione pelo menos um pedido');
+      return;
+    }
+
+    // If creating new route, montador is required
+    if (!selectedExistingRoute && !selectedMontador) {
+      toast.error('Por favor, selecione um montador - o montador é obrigatório');
+      return;
+    }
+
+    // If creating new route, vehicle is required
+    if (!selectedExistingRoute && !selectedVehicle) {
+      toast.error('Por favor, selecione um veículo - o veículo é obrigatório');
+      return;
+    }
+
+    // If creating new route, deadline is required
+    if (!selectedExistingRoute && !deadline) {
+      toast.error('Por favor, informe o prazo de conclusão');
+      return;
+    }
+
+    setSaving(true);
+
+    try {
+      // Get products for selected orders
+      const selectedOrderIds = Array.from(selectedOrders);
+      const productsForRoute = assemblyPending.filter(ap =>
+        selectedOrderIds.includes(String(ap.order_id)) &&
+        !ap.assembly_route_id &&
+        ap.status === 'pending'
+      );
+
+      if (productsForRoute.length === 0) {
+        toast.error('Nenhum produto disponível para os pedidos selecionados');
+        return;
+      }
+
+      let targetRouteId: string;
+      let targetInstallerId: string | null = null;
+
+      if (selectedExistingRoute) {
+        // Adding to existing route
+        targetRouteId = selectedExistingRoute;
+        // Get the existing route's assembler_id
+        const existingRoute = allPendingRoutes.find(r => r.id === selectedExistingRoute)
+          || assemblyRoutes.find(r => r.id === selectedExistingRoute);
+        targetInstallerId = (existingRoute as any)?.assembler_id || null;
+      } else {
+        // Create new route
+        // Generate unique route code
+        const routeCode = await generateRouteCode();
+
+        const { data: routeData, error: routeError } = await supabase
+          .from('assembly_routes')
+          .insert({
+            name: selectedCatalogRouteName,
+            deadline: deadline || null,
+            observations: observations.trim() || null,
+            assembler_id: selectedMontador || null,
+            vehicle_id: selectedVehicle || null,
+            status: 'pending',
+            route_code: routeCode,
+          })
+          .select()
+          .single();
+
+        if (routeError) throw routeError;
+        targetRouteId = routeData.id;
+        targetInstallerId = selectedMontador || null;
+      }
+
+      // Update products with route and installer
+      const productIds = productsForRoute.map(p => p.id);
+
+      const { error: updateError } = await supabase
+        .from('assembly_products')
+        .update({
+          assembly_route_id: targetRouteId,
+          installer_id: targetInstallerId
+        })
+        .in('id', productIds);
+
+      if (updateError) throw updateError;
+
+      toast.success(selectedExistingRoute
+        ? 'Pedidos adicionados a rota de montagem existente!'
+        : 'Rota de montagem criada com sucesso!');
+
+      // Reset form
+      setSelectedDeliveryRouteId('');
+      setSelectedMontador('');
+      setSelectedVehicle('');
+      setObservations('');
+      setDeadline('');
+      setSelectedExistingRoute('');
+      setSelectedOrders(new Set());
+      setShowCreateModal(false);
+
+      // Reload data
+      loadData(false);
+
+    } catch (error) {
+      console.error('Error creating assembly route:', error);
+      toast.error('Erro ao criar rota de montagem');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const saveRouteEdits = async () => {
+    if (!selectedRoute) return;
+    const selectedCatalogRouteName = deliveryRouteCatalog
+      .find((route) => String(route.id) === String(editSelectedDeliveryRouteId))
+      ?.name
+      ?.trim() || '';
+
+    if (!selectedCatalogRouteName) {
+      toast.error('Por favor, selecione uma rota de montagem cadastrada');
+      return;
+    }
+    if (!editRouteMontador) {
+      toast.error('Por favor, selecione um montador - o montador é obrigatório');
+      return;
+    }
+
+    setSavingEdit(true);
+    try {
+      const { error } = await supabase
+        .from('assembly_routes')
+        .update({
+          name: selectedCatalogRouteName,
+          assembler_id: editRouteMontador || null,
+          vehicle_id: editRouteVehicle || null,
+          deadline: editRouteDeadline || null,
+          observations: editRouteObservations.trim() || null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', selectedRoute.id);
+
+      if (error) throw error;
+
+      toast.success('Rota de montagem atualizada com sucesso!');
+      setIsEditingRoute(false);
+
+      // Update the selectedRoute in state
+      setSelectedRoute({
+        ...selectedRoute,
+        name: selectedCatalogRouteName,
+        assembler_id: editRouteMontador || null,
+        vehicle_id: editRouteVehicle || null,
+        deadline: editRouteDeadline || null,
+        observations: editRouteObservations.trim() || null,
+      } as any);
+
+      // Reload data to refresh the list
+      loadData(true);
+    } catch (error) {
+      console.error('Error updating assembly route:', error);
+      toast.error('Erro ao atualizar rota de montagem');
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  // Remove all products of an order from the current route (return to pending)
+  const removeOrderFromRoute = async (orderId: string) => {
+    if (!selectedRoute) return;
+    if ((selectedRoute as any).status === 'completed') {
+      toast.error('Não é possível remover pedidos de rotas finalizadas');
+      return;
+    }
+
+    try {
+      // Get all products for this order in this route
+      const productsToRemove = assemblyInRoutes.filter(
+        ap => ap.assembly_route_id === selectedRoute.id && String(ap.order_id) === String(orderId)
+      );
+
+      if (productsToRemove.length === 0) {
+        toast.error('Nenhum produto encontrado para remover');
+        return;
+      }
+
+      // Update products to remove them from the route (set assembly_route_id to null)
+      const productIds = productsToRemove.map(p => p.id);
+      const { error } = await supabase
+        .from('assembly_products')
+        .update({ assembly_route_id: null, status: 'pending', updated_at: new Date().toISOString() })
+        .in('id', productIds);
+
+      if (error) throw error;
+
+      toast.success('Pedido removido da rota');
+      loadData(true);
+    } catch (error) {
+      console.error('Error removing order from route:', error);
+      toast.error('Erro ao remover pedido da rota');
+    }
+  };
+
+  // Delete an empty route
+  const deleteEmptyRoute = async () => {
+    if (!selectedRoute) return;
+    if ((selectedRoute as any).status !== 'pending') {
+      toast.error('Não é possível excluir rotas finalizadas');
+      return;
+    }
+
+    // Check if route has any products
+    const productsInRoute = assemblyInRoutes.filter(ap => ap.assembly_route_id === selectedRoute.id);
+    if (productsInRoute.length > 0) {
+      toast.error('Não é possível excluir rota com pedidos. Remova todos os pedidos primeiro.');
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from('assembly_routes')
+        .delete()
+        .eq('id', selectedRoute.id);
+
+      if (error) throw error;
+
+      toast.success('Rota excluída com sucesso');
+      setShowRouteModal(false);
+      setSelectedRoute(null);
+      loadData(true);
+    } catch (error) {
+      console.error('Error deleting route:', error);
+      toast.error('Erro ao excluir rota');
+    }
+  };
+
+  // --- SINGLE LAUNCH IMPORT HANDLER ---
+  // Esta função importa lançamentos avulsos (troca/assistência) diretamente para a tabela assembly_products,
+  // pulando o gatilho normal de entrega. O pedido é salvo em orders com status 'delivered' 
+  // e os produtos são inseridos diretamente em assembly_products com status 'pending'.
+  // --- SINGLE LAUNCH IMPORT HANDLER ---
+  // Steps:
+  // 1. Fetch data from webhook
+  // 2. Show preview modal with product selection
+  // 3. Confirm import with selected products only
+
+  const fetchLaunchData = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!launchNumber.trim()) { toast.error('Digite o número do lançamento'); return; }
+
+    setLaunchLoading(true);
+    setLaunchPreviewData(null);
+    setSelectedPreviewIndices(new Set());
+
+    try {
+      let webhookUrl = import.meta.env.VITE_WEBHOOK_URL_CONSULTA as string | undefined;
+      if (!webhookUrl) {
+        const { data } = await supabase.from('webhook_settings').select('url').eq('key', 'consulta_lancamento').eq('active', true).single();
+        webhookUrl = data?.url;
+      }
+
+      if (!webhookUrl) {
+        webhookUrl = 'https://n8n.lojaodosmoveis.shop/webhook-test/ca7881e9-b639-452c-8eca-33f410358530'; // Fallback
+      }
+
+      const body = {
+        lancamento: launchNumber.trim(),
+        tipo: launchType,
+        timestamp: new Date().toISOString()
+      };
+
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      if (!response.ok) throw new Error(`Erro ${response.status}: ${response.statusText}`);
+
+      const text = await response.text();
+      let data: any;
+      try { data = JSON.parse(text); } catch { throw new Error('Resposta inválida do servidor (não é JSON)'); }
+
+      const items = Array.isArray(data) ? data : [data];
+      if (items.length === 0 || !items[0]) {
+        toast.error('Nenhum pedido encontrado com este lançamento');
+        setLaunchLoading(false);
+        return;
+      }
+
+      // Pre-process items to facilitate selection
+      // We will flatten products for selection, but keep structure for final import
+      const previewItems: any[] = [];
+
+      items.forEach((item: any, itemIdx: number) => {
+        const produtos = Array.isArray(item.produtos) ? item.produtos : (Array.isArray(item.produtos_locais) ? item.produtos_locais : []);
+        // Filter 'Sim' assembly products here for the preview? Or show all?
+        // User requested: "selecionar o produto que quero importar"
+        // Logic shows only assembly products in the end, so let's show only 'Sim' products in preview to avoid confusion
+
+        const validProducts = produtos.filter((p: any) => {
+          const checkMontavel = String(p.produto_e_montavel || 'Sim').trim().toUpperCase();
+          return checkMontavel === 'SIM';
+        });
+
+        if (validProducts.length > 0) {
+          // Attach a unique key for selection
+          // We do NOT expand here anymore as per user request. 
+          // We will expand during the INSERTION phase.
+          const enrichedProducts = validProducts.map((p: any, pIdx: number) => ({
+            ...p,
+            _selectionKey: `${itemIdx}-${pIdx}`, // Simple key
+            _parentItem: item
+          }));
+
+          // We'll store the full item but replace products with enriched ones for this view context
+          previewItems.push({
+            ...item,
+            _originalProducts: produtos, // Keep original
+            produtos: enrichedProducts
+          });
+        }
+      });
+
+      if (previewItems.length === 0) {
+        toast.warning('Pedido encontrado, mas não possui produtos marcados como montáveis.');
+        setLaunchLoading(false);
+        return;
+      }
+
+      setLaunchPreviewData(previewItems);
+      // Auto-select all by default? Or none? Let's select all by default for convenience
+      const allKeys = new Set<string>();
+      previewItems.forEach(item => {
+        item.produtos.forEach((p: any) => allKeys.add(p._selectionKey));
+      });
+      setSelectedPreviewIndices(allKeys);
+      // Inicializar observação interna com valor do ERP (se existir)
+      const firstItem = previewItems[0];
+      setLaunchObservation(String(firstItem?.observacoes_internas || ''));
+      setLaunchLoading(false);
+
+    } catch (e: any) {
+      console.error(e);
+      toast.error(`Erro: ${e.message}`);
+      setLaunchLoading(false);
+    }
+  };
+
+  const confirmLaunchImport = async () => {
+    if (!launchPreviewData) return;
+
+    if (selectedPreviewIndices.size === 0) {
+      toast.error('Selecione pelo menos um produto para importar.');
+      return;
+    }
+
+    setLaunchLoading(true);
+    try {
+      const items = launchPreviewData;
+
+      let insertedProductsCount = 0;
+      let errors = 0;
+      const now = new Date().toISOString();
+      const importedOrderIds: string[] = [];
+
+      for (const o of items) {
+        const produtos = Array.isArray(o.produtos) ? o.produtos : [];
+        const getVal = (v: any) => String(v ?? '').trim();
+
+        const pickZip = (raw: any) => {
+          const candidates = [raw?.destinatario_cep, raw?.cep, raw?.endereco_cep, raw?.codigo_postal, raw?.zip];
+          for (const c of candidates) { const s = String(c || '').trim(); if (s) return s; }
+          return '';
+        };
+
+        const selectedProducts = produtos.filter((p: any) => selectedPreviewIndices.has(p._selectionKey));
+        if (selectedProducts.length === 0) {
+          toast.info('Nenhum produto selecionado para importar.');
+          continue;
+        }
+
+        let erpId = String(o.numero_lancamento ?? o.lancamento_venda ?? o.codigo_cliente ?? launchNumber).trim();
+        if (launchType !== 'venda') {
+          const suffixType = launchType === 'troca' ? '-T' : '-A';
+          const baseId = erpId.replace(/-(T|A)(-\d+)?$/i, '');
+
+          const { data: siblingOrders } = await supabase
+            .from('orders')
+            .select('order_id_erp')
+            .ilike('order_id_erp', `${baseId}%`);
+
+          if (!siblingOrders || siblingOrders.length === 0) {
+            erpId = `${baseId}${suffixType}-1`;
+          } else {
+            let highestSeq = 0;
+            siblingOrders.forEach((so: any) => {
+              const m = String(so.order_id_erp || '').match(/-(T|A)(?:-(\d+))?$/i);
+              if (m) {
+                const seqNum = m[2] ? parseInt(m[2], 10) : 1;
+                if (!isNaN(seqNum) && seqNum > highestSeq) highestSeq = seqNum;
+              }
+            });
+            erpId = `${baseId}${suffixType}-${highestSeq + 1}`;
+          }
+        }
+
+        const { data: existingOrder } = await supabase
+          .from('orders')
+          .select('id, order_id_erp, customer_name, phone, address_json')
+          .eq('order_id_erp', erpId)
+          .single();
+
+        let orderId: string;
+        let orderCustomerName = getVal(o.nome_cliente);
+        let orderPhone = getVal(o.cliente_celular);
+        let orderAddress: any = {
+          street: getVal(o.destinatario_endereco),
+          neighborhood: getVal(o.destinatario_bairro),
+          city: getVal(o.destinatario_cidade),
+          state: '',
+          zip: pickZip(o),
+          complement: getVal(o.destinatario_complemento),
+          lat: o.lat ?? o.latitude ?? null,
+          lng: o.lng ?? o.longitude ?? o.long ?? null
+        };
+
+        if (existingOrder) {
+          orderId = existingOrder.id;
+          orderCustomerName = getVal(existingOrder.customer_name) || orderCustomerName;
+          orderPhone = getVal(existingOrder.phone) || orderPhone;
+          orderAddress = existingOrder.address_json || orderAddress;
+
+          try {
+            const { data: orderData } = await supabase
+              .from('orders')
+              .select('items_json')
+              .eq('id', existingOrder.id)
+              .single();
+
+            if (orderData && Array.isArray(orderData.items_json)) {
+              const selectedSkus = selectedProducts
+                .map((p: any) => String(p.codigo_produto || '').toLowerCase().trim());
+
+              const updatedItemsJson = orderData.items_json.map((item: any) => {
+                const itemSku = String(item.sku || '').toLowerCase().trim();
+                if (selectedSkus.includes(itemSku)) {
+                  return { ...item, has_assembly: 'Sim' };
+                }
+                return item;
+              });
+
+              await supabase
+                .from('orders')
+                .update({
+                  items_json: updatedItemsJson,
+                  observacoes_internas: launchObservation || orderData.observacoes_internas || ''
+                })
+                .eq('id', existingOrder.id);
+            }
+          } catch (updateErr) {
+            console.warn('Aviso: nao foi possivel atualizar items_json com has_assembly:', updateErr);
+          }
+        } else {
+          const itemsJson = selectedProducts.map((p: any) => ({
+            sku: getVal(p.codigo_produto),
+            name: getVal(p.nome_produto),
+            quantity: Number(p.quantidade_volumes ?? 1),
+            volumes_per_unit: Number(p.quantidade_volumes ?? 1),
+            purchased_quantity: Number(p.quantidade_comprada ?? 1),
+            unit_price_real: Number(p.valor_unitario_real ?? p.valor_unitario ?? 0),
+            total_price_real: Number(p.valor_total_real ?? p.valor_total_item ?? 0),
+            unit_price: Number(p.valor_unitario_real ?? p.valor_unitario ?? 0),
+            total_price: Number(p.valor_total_real ?? p.valor_total_item ?? 0),
+            price: Number(p.valor_unitario_real ?? p.valor_unitario ?? 0),
+            location: getVal(p.local_estocagem),
+            has_assembly: 'Sim',
+            produto_e_montavel: getVal(p.produto_e_montavel),
+            labels: Array.isArray(p.etiquetas) ? p.etiquetas : [],
+            department: getVal(p.departamento),
+            brand: getVal(p.marca),
+          }));
+
+          const orderRecord = {
+            order_id_erp: erpId,
+            customer_name: orderCustomerName,
+            phone: orderPhone,
+            customer_cpf: getVal(o.cpf_cliente),
+            filial_venda: getVal(o.filial_venda),
+            vendedor_nome: getVal(o.nome_vendedor ?? o.vendedor ?? o.vendedor_nome),
+            data_venda: o.data_venda ? new Date(o.data_venda).toISOString() : now,
+            previsao_entrega: o.previsao_entrega ? new Date(o.previsao_entrega).toISOString() : null,
+            previsao_montagem: o.previsao_montagem ? new Date(o.previsao_montagem).toISOString() : null,
+            observacoes_publicas: getVal(o.observacoes_publicas),
+            observacoes_internas: launchObservation || getVal(o.observacoes_internas),
+            tem_frete_full: getVal(o.tem_frete_full),
+            address_json: orderAddress,
+            items_json: itemsJson,
+            status: 'delivered',
+            raw_json: o,
+            service_type: launchType === 'venda' ? undefined : launchType,
+            department: String(itemsJson[0]?.department || ''),
+            brand: String(itemsJson[0]?.brand || ''),
+            product_group: String(o.produtos?.[0]?.grupo_produto || ''),
+            product_subgroup: String(o.produtos?.[0]?.subgrupo_produto || ''),
+            import_source: 'avulsa',
+          };
+
+          const { data: insertedOrder, error: orderError } = await supabase
+            .from('orders')
+            .insert(orderRecord)
+            .select('id')
+            .single();
+
+          if (orderError) {
+            console.error('Erro ao inserir pedido:', orderError);
+            errors++;
+            continue;
+          }
+
+          orderId = insertedOrder.id;
+        }
+
+        const assemblyProductsToInsert: any[] = [];
+        let skipThisOrder = false;
+
+        for (const p of selectedProducts) {
+          const cleanSku = getVal(p.codigo_produto) || 'SKU-INDEF';
+          const cleanName = getVal(p.nome_produto) || 'Produto sem nome';
+          const qty = Math.max(1, Number(p.quantidade_comprada ?? p.quantidade ?? p.quantidade_volumes ?? 1) || 1);
+
+          const { count: currentCount, error: countError } = await supabase
+            .from('assembly_products')
+            .select('*', { count: 'exact', head: true })
+            .eq('order_id', orderId)
+            .eq('product_sku', cleanSku);
+
+          if (countError) {
+            console.error('[AssemblyManagement] Erro ao verificar montagem existente:', countError);
+            errors++;
+            skipThisOrder = true;
+            break;
+          }
+
+          const missingCount = qty - (currentCount || 0);
+          if (missingCount <= 0) continue;
+
+          for (let i = 0; i < missingCount; i++) {
+            assemblyProductsToInsert.push({
+              order_id: orderId,
+              product_name: cleanName,
+              product_sku: cleanSku,
+              customer_name: orderCustomerName,
+              customer_phone: orderPhone || null,
+              installation_address: orderAddress || null,
+              status: 'pending',
+              created_at: now,
+              updated_at: now
+            });
+          }
+        }
+
+        if (skipThisOrder) continue;
+
+        if (assemblyProductsToInsert.length > 0) {
+          const { error: insertAssemblyError } = await supabase
+            .from('assembly_products')
+            .insert(assemblyProductsToInsert);
+
+          if (insertAssemblyError) {
+            console.error('[AssemblyManagement] Erro ao gerar montagem avulsa:', insertAssemblyError);
+            errors++;
+            continue;
+          }
+
+          insertedProductsCount += assemblyProductsToInsert.length;
+          importedOrderIds.push(orderId);
+          console.log(`[AssemblyManagement] Pedido ${erpId}: ${assemblyProductsToInsert.length} item(ns) de montagem gerado(s) na importacao avulsa.`);
+        }
+      }
+
+      if (errors > 0 && insertedProductsCount === 0) {
+        toast.error(`Erro ao importar. Verifique se o pedido já existe.`);
+      } else if (errors > 0) {
+        toast.warning(`${insertedProductsCount} produto(s) importado(s), ${errors} erro(s).`);
+        if (importedOrderIds.length > 0) {
+          await loadData(false);
+          setSelectedOrders(prev => {
+            const newSet = new Set(prev);
+            importedOrderIds.forEach(id => newSet.add(id));
+            return newSet;
+          });
+        }
+      } else if (insertedProductsCount > 0) {
+        const tipoLabel = launchType === 'troca' ? 'Troca' : launchType === 'assistencia' ? 'Assistência' : 'Pedido';
+        toast.success(`${tipoLabel} importado(s) com sucesso! ${insertedProductsCount} produto(s) disponíveis para montagem.`);
+        setShowLaunchModal(false);
+        setLaunchNumber('');
+        setLaunchPreviewData(null); // Clear preview
+        setLaunchObservation(''); // Clear observation
+        await loadData(false);
+
+        setSelectedOrders(prev => {
+          const newSet = new Set(prev);
+          importedOrderIds.forEach(id => newSet.add(id));
+          return newSet;
+        });
+      } else {
+        toast.info('Nenhum produto importado.');
+      }
+
+    } catch (e: any) {
+      console.error(e);
+      toast.error(`Erro: ${e.message}`);
+    } finally {
+      setLaunchLoading(false);
+    }
+  };
+
+  const handleLaunchSubmit = fetchLaunchData;
+
+
+  // --- RENDER ---
+
+
+  // Group products by order for display
+  const groupedProducts = useMemo(() => {
+    const grouped: Record<string, AssemblyProductWithDetails[]> = {};
+
+    assemblyPending.forEach(ap => {
+      if (ap.status === 'pending' && !ap.assembly_route_id) {
+        const orderId = String(ap.order_id);
+        if (!grouped[orderId]) grouped[orderId] = [];
+        grouped[orderId].push(ap);
+      }
+    });
+
+    return grouped;
+  }, [assemblyPending]);
+
+  // Filter grouped products
+  const filteredGroupedProducts = useMemo(() => {
+    const filtered: Record<string, AssemblyProductWithDetails[]> = {};
+
+    // Helper para verificar valores "verdadeiros"
+    const isTrueValue = (v: any) => {
+      if (typeof v === 'boolean') return v;
+      const s = String(v || '').trim().toLowerCase();
+      return s === 'true' || s === '1' || s === 'sim' || s === 's' || s === 'y' || s === 'yes' || s === 't';
+    };
+
+    Object.entries(groupedProducts).forEach(([orderId, products]) => {
+      const firstProduct = products[0];
+      const order = firstProduct?.order as any;
+      const addr = (order?.address_json || {}) as any;
+
+      const city = (addr.city || '').toLowerCase();
+      const neighborhood = (addr.neighborhood || '').toLowerCase();
+
+      // New fields extraction
+      const orderNum = String(order?.order_id_erp || '').toLowerCase();
+      const clientName = String(order?.customer_name || '').toLowerCase();
+
+      const saleDateStr = order?.data_venda ? order.data_venda.split('T')[0] : '';
+      const deliveryDateStr = deliveryInfo[orderId] ? deliveryInfo[orderId].split('T')[0] : '';
+
+      let forecastDateStr = '';
+      const prevDate = getPrevisaoMontagem(order);
+      if (prevDate) {
+        forecastDateStr = dateToString(prevDate);
+      }
+
+      const matchCity = filterCity.length === 0 ? true : filterCity.some(fc => city.includes(fc.toLowerCase()));
+      const matchNeighborhood = filterNeighborhood.length === 0 ? true : filterNeighborhood.some(fn => neighborhood.includes(fn.toLowerCase()));
+
+      const prazo = getPrazoStatusForOrder(order);
+      const matchPrazo = filterDeadline === 'all' ? true : filterDeadline === prazo;
+
+      // New filters logic
+      const matchOrder = filterOrder ? orderNum.includes(filterOrder.toLowerCase()) : true;
+      const matchClient = filterClient ? clientName.includes(filterClient.toLowerCase()) : true;
+
+      // Date Range logic helper
+      const checkDateRange = (dateStr: string, start: string, end: string) => {
+        if (!start && !end) return true;
+        if (!dateStr) return false;
+        if (start && dateStr < start) return false;
+        if (end && dateStr > end) return false;
+        return true;
+      };
+
+      const matchSaleDate = checkDateRange(saleDateStr, filterSaleDateStart, filterSaleDateEnd);
+      const matchDeliveryDate = checkDateRange(deliveryDateStr, filterDeliveryDateStart, filterDeliveryDateEnd);
+      const matchForecastDate = checkDateRange(forecastDateStr, filterForecastDateStart, filterForecastDateEnd);
+
+      // Retornados: verificar se algum produto do grupo foi retornado (was_returned)
+      const hasReturnedProduct = products.some((ap: any) => ap.was_returned === true);
+      const isReturnedFlag = hasReturnedProduct || Boolean(order?.return_flag) || String(order?.status) === 'returned';
+      const matchReturned = filterReturned ? isReturnedFlag : true;
+
+      // Service Type Filter
+      let matchServiceType = true;
+      if (filterServiceType) {
+        const st = (order?.service_type || 'normal').toLowerCase();
+        if (filterServiceType === 'normal') {
+          // If filtering for 'normal', exclude explicit 'troca' or 'assistencia' if they exist, or allow if null/normal
+          if (order?.service_type && order.service_type !== 'normal') matchServiceType = false;
+        } else {
+          // data matches exactly
+          if (st !== filterServiceType) matchServiceType = false;
+        }
+      }
+
+      // Frete Full Filter
+      const raw = order?.raw_json || {};
+      const obsInternas = String(order?.observacoes_internas || raw?.observacoes_internas || '').toLowerCase();
+      const isFullFlag = isTrueValue(order?.tem_frete_full) || isTrueValue(raw?.tem_frete_full) || obsInternas.includes('*frete full*');
+      const matchFull = filterFull ? isFullFlag : true;
+      // Also check checkbox filterFreightFull (if used as select or checkbox) - assuming checkbox logic in state
+      // Actually filterFull is the checkbox state from UI above.
+
+      // --- NEW: Group / Subgroup Filters ---
+      const dept = String(order?.product_group || order?.department || '').toLowerCase();
+      const sub = String(order?.product_subgroup || '').toLowerCase();
+
+      // Department Filter: check if order department is in the selected list
+      const matchDepartment = filterDepartment.length === 0 ? true : filterDepartment.some(fd => dept === fd.toLowerCase());
+
+      // Subgroup Filter
+      const matchSubgroup = filterSubgroup.length === 0 ? true : filterSubgroup.some(fs => sub === fs.toLowerCase());
+
+
+      // --- NEW FILTERS IMPLEMENTATION ---
+      const filial = String(order?.filial_venda || raw?.filial_venda || '').toLowerCase();
+      const seller = String(order?.vendedor_nome || raw?.nome_vendedor || raw?.vendedor || '').toLowerCase();
+      const operation = String(raw?.operacoes || '').toLowerCase();
+      // Brand usually on items. We check if ANY item in the order matches?
+      // Or just check first item since we flattened? Logic in similar tools usually checks if AT LEAST ONE matches or order level.
+      // Assembly Management works on Order Grouping.
+      // We'll check if the order (or its products) match.
+      // Simplified: check field on order record if available or first product.
+      const brand = String((order as any)?.brand || raw?.marca || (products[0] as any)?.product_brand || '').toLowerCase();
+
+      const matchFilial = filterFilialVenda ? filial === filterFilialVenda.toLowerCase() : true;
+      const matchSeller = filterSeller ? seller === filterSeller.toLowerCase() : true;
+      const matchOperation = filterOperation ? operation === filterOperation.toLowerCase() : true;
+      // const matchBrand = filterBrand ? brand.includes(filterBrand.toLowerCase()) : true; // Disabled brand for now as input missing
+
+      // Montagem Filter
+      // Check if ANY item in the order has assembly='Sim'
+      // Or check specific field. The implementation plan says "Tem Montagem".
+      // We check if order.items_json has any helper or if products list implies it.
+      // Since this is Assembly Management, MOST items should have assembly.
+      // But maybe some don't?
+      const matchHasAssembly = filterHasAssembly ? (products.some(p => isTrueValue((p as any).produto_e_montavel) || isTrueValue((p as any).has_assembly))) : true;
+
+      // Strict Department (if enabled) - usually means only show orders where ALL items match department? 
+      // Ignored for now as strictDepartment state isn't toggleable in UI yet.
+
+      if (matchCity && matchNeighborhood && matchPrazo && matchOrder && matchClient && matchSaleDate && matchDeliveryDate && matchForecastDate && matchReturned && matchFull && matchServiceType && matchDepartment && matchSubgroup && matchFilial && matchSeller && matchOperation && matchHasAssembly) {
+        filtered[orderId] = products;
+      }
+    });
+
+    return filtered;
+  }, [groupedProducts, filterCity, filterNeighborhood, filterDeadline, filterOrder, filterClient, filterSaleDateStart, filterSaleDateEnd, filterDeliveryDateStart, filterDeliveryDateEnd, filterForecastDateStart, filterForecastDateEnd, filterReturned, filterFull, filterServiceType, deliveryInfo, filterDepartment, filterSubgroup]);
+
+  const orderRows = useMemo(() => {
+    const rows: Array<{ key: string; orderId: string; dataVenda: string; entrega: string; previsao: string; pedido: string; cliente: string; telefone: string; produto: string; sku: string; obsPublicas: string; obsInternas: string; cidade: string; bairro: string; endereco: string; selected: boolean; wasReturned: boolean; prazoStatus: 'within' | 'out' | 'none'; temFreteFull: boolean; returnReason: string; returnObservation: string; department: string; subgroup: string; }> = [];
+
+    // Helper para verificar se pedido tem Frete Full
+    const isTrueValue = (v: any) => {
+      if (typeof v === 'boolean') return v;
+      const s = String(v || '').trim().toLowerCase();
+      return s === 'true' || s === '1' || s === 'sim' || s === 's' || s === 'y' || s === 'yes' || s === 't';
+    };
+    Object.entries(filteredGroupedProducts).forEach(([orderId, products]) => {
+      const order = products[0]?.order || {} as any;
+      const raw = order?.raw_json || {};
+      const addr = order?.address_json || {};
+      const dataVenda = formatDate(order?.data_venda || order?.created_at);
+      const entrega = formatDate(deliveryInfo[orderId] || null);
+
+      const previsao = formatDate(getPrevisaoMontagemValue(order) || null);
+
+      const pedido = order?.order_id_erp || orderId;
+      const cliente = order?.customer_name || '-';
+      const telefone = String(order?.phone || raw?.cliente_celular || '-');
+      const obsPublicas = order?.observacoes_publicas || raw?.observacoes || '-';
+      const obsInternas = order?.observacoes_internas || raw?.observacoes_internas || '-';
+      const cidade = addr.city || '-';
+      const bairro = addr.neighborhood || '-';
+      const endereco = [addr.street, addr.number, addr.complement].filter(Boolean).join(', ') || '-';
+      const selected = selectedOrders.has(orderId);
+      const prazoStatus = getPrazoStatusForOrder(order);
+      // Verificar Frete Full: campo direto OU observações internas com *frete full*
+      const temFreteFull = isTrueValue(order?.tem_frete_full) || isTrueValue(raw?.tem_frete_full) || obsInternas.toLowerCase().includes('*frete full*');
+      products.forEach((ap, idx) => {
+        const wasReturned = (ap as any).was_returned === true;
+        // Extract return reason from observations field (format: "Retorno: <motivo>" or "(Retorno: <motivo>) <obs>")
+        const obsValue = String((ap as any).observations || '');
+        let returnReason = '';
+        let returnObservation = '';
+        if (wasReturned && obsValue) {
+          const matchParens = obsValue.match(/^\(Retorno:\s*(.+?)\)\s*(.*)/);
+          const matchSimple = obsValue.match(/^Retorno:\s*(.+)$/);
+          if (matchParens) {
+            returnReason = matchParens[1].trim();
+            returnObservation = matchParens[2]?.trim() || '';
+          } else if (matchSimple) {
+            returnReason = matchSimple[1].trim();
+          }
+        }
+        const department = String(order?.product_group || order?.department || '-');
+        const subgroup = String(order?.product_subgroup || '-');
+        rows.push({ key: `${orderId}-${ap.id}-${idx}`, orderId, dataVenda, entrega, previsao, pedido, cliente, telefone, produto: ap.product_name || '-', sku: ap.product_sku || '-', obsPublicas, obsInternas, cidade, bairro, endereco, selected, wasReturned, prazoStatus, temFreteFull, returnReason, returnObservation, department, subgroup });
+      });
+    });
+    return rows;
+  }, [filteredGroupedProducts, deliveryInfo, selectedOrders]);
+
+  // Apply sorting
+  const sortedOrderRows = useMemo(() => {
+    if (!sortColumn) return orderRows;
+
+    // Helper to parse date string DD/MM/YYYY to timestamp for comparison
+    const parseDateStr = (str: string) => {
+      if (!str || str === '-') return 0;
+      try {
+        const [d, m, y] = str.split('/').map(Number);
+        return new Date(y, m - 1, d).getTime();
+      } catch { return 0; }
+    };
+
+    return [...orderRows].sort((a, b) => {
+      let valA: any = (a as any)[sortColumn];
+      let valB: any = (b as any)[sortColumn];
+
+      // Clean values
+      if (valA === '-') valA = '';
+      if (valB === '-') valB = '';
+
+      // Determine type based on column ID
+      const isDate = ['dataVenda', 'entrega', 'previsao'].includes(sortColumn);
+
+      if (isDate) {
+        valA = parseDateStr(valA);
+        valB = parseDateStr(valB);
+      } else {
+        // Text comparison
+        valA = String(valA || '').toLowerCase();
+        valB = String(valB || '').toLowerCase();
+      }
+
+      if (valA < valB) return sortDirection === 'asc' ? -1 : 1;
+      if (valA > valB) return sortDirection === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }, [orderRows, sortColumn, sortDirection]);
+
+  const totalOrderRows = sortedOrderRows.length;
+  const totalPages = Math.max(1, Math.ceil(totalOrderRows / ordersPageSize));
+  const visibleRows = useMemo(() => {
+    const start = (ordersPage - 1) * ordersPageSize;
+    return sortedOrderRows.slice(start, start + ordersPageSize);
+  }, [sortedOrderRows, ordersPage, ordersPageSize]);
+
+  const handleSort = (columnId: string) => {
+    if (sortColumn === columnId) {
+      setSortDirection(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortColumn(columnId);
+      // Default directions: Dates -> desc, Text -> asc
+      const isDate = ['dataVenda', 'entrega', 'previsao'].includes(columnId);
+      setSortDirection(isDate ? 'desc' : 'asc');
+    }
+  };
+
+  return (
+    <div className="w-full pb-20">
+      {loading && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-white/70">
+          <div className="flex flex-col items-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div>
+            <span className="text-gray-700 font-medium">Carregando painel de montagem...</span>
+          </div>
+        </div>
+      )}
+
+      <div className="w-full px-4 sm:px-6 lg:px-8 pb-6 pt-2 space-y-6">
+
+        {!loading && (
+          <>
+
+            {/* Quick navigation */}
+            <div className="mb-2">
+              <div className="bg-white shadow-sm border border-gray-200 rounded-xl px-4 py-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-sm text-gray-700">
+                  <MapPin className="h-4 w-4 text-blue-500" />
+                  Acesso rápido
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => scrollToSection(ordersSectionRef)}
+                    className="px-3 py-2 text-sm font-medium rounded-lg border border-gray-200 bg-white hover:bg-gray-50 text-gray-700"
+                  >
+                    Ir para pedidos
+                  </button>
+                  <button
+                    onClick={() => scrollToSection(routesSectionRef)}
+                    className="px-3 py-2 text-sm font-medium rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100"
+                  >
+                    Ir para rotas de montagem
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Filters Panel */}
+            <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 animate-in slide-in-from-top-2 duration-200">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+
+                {/* Row 1 */}
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Pedido</label>
+                  <input
+                    type="text"
+                    value={filterOrder}
+                    onChange={(e) => setFilterOrder(e.target.value)}
+                    placeholder="Nº Pedido"
+                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all placeholder:text-gray-400"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Cliente</label>
+                  <input
+                    type="text"
+                    value={filterClient}
+                    onChange={(e) => setFilterClient(e.target.value)}
+                    placeholder="Nome do cliente"
+                    className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all placeholder:text-gray-400"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Cidade</label>
+                  <MultiSelect
+                    options={cityOptions}
+                    selected={filterCity}
+                    onChange={setFilterCity}
+                    placeholder="Todas"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Bairro</label>
+                  <MultiSelect
+                    options={neighborhoodOptions}
+                    selected={filterNeighborhood}
+                    onChange={setFilterNeighborhood}
+                    placeholder="Todos"
+                  />
+                </div>
+
+                {/* Row 2 */}
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Data Venda (Período)</label>
+                  <div className="w-full">
+                    <DatePicker
+                      selectsRange={true}
+                      startDate={stringToDate(filterSaleDateStart)}
+                      endDate={stringToDate(filterSaleDateEnd)}
+                      onChange={(update) => {
+                        const [start, end] = update;
+                        setFilterSaleDateStart(dateToString(start));
+                        setFilterSaleDateEnd(dateToString(end));
+                      }}
+                      isClearable={true}
+                      locale="pt-BR"
+                      dateFormat="dd/MM/yyyy"
+                      placeholderText="Selecione o período"
+                      className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-gray-600 text-sm"
+                      wrapperClassName="w-full"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Data Entrega (Período)</label>
+                  <div className="w-full">
+                    <DatePicker
+                      selectsRange={true}
+                      startDate={stringToDate(filterDeliveryDateStart)}
+                      endDate={stringToDate(filterDeliveryDateEnd)}
+                      onChange={(update) => {
+                        const [start, end] = update;
+                        setFilterDeliveryDateStart(dateToString(start));
+                        setFilterDeliveryDateEnd(dateToString(end));
+                      }}
+                      isClearable={true}
+                      locale="pt-BR"
+                      dateFormat="dd/MM/yyyy"
+                      placeholderText="Selecione o período"
+                      className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-gray-600 text-sm"
+                      wrapperClassName="w-full"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Previsao Montagem (Periodo)</label>
+                  <div className="w-full">
+                    <DatePicker
+                      selectsRange={true}
+                      startDate={stringToDate(filterForecastDateStart)}
+                      endDate={stringToDate(filterForecastDateEnd)}
+                      onChange={(update) => {
+                        const [start, end] = update;
+                        setFilterForecastDateStart(dateToString(start));
+                        setFilterForecastDateEnd(dateToString(end));
+                      }}
+                      isClearable={true}
+                      locale="pt-BR"
+                      dateFormat="dd/MM/yyyy"
+                      placeholderText="Selecione o período"
+                      className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-gray-600 text-sm"
+                      wrapperClassName="w-full"
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Status Prazo</label>
+                  <select value={filterDeadline} onChange={(e) => setFilterDeadline(e.target.value as any)} className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <option value="all">Todos</option>
+                    <option value="within">Dentro do prazo</option>
+                    <option value="out">Fora do prazo</option>
+                  </select>
+                </div>
+
+                {/* Row 3 - New Filters */}
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Filial</label>
+                  <select value={filterFilialVenda} onChange={(e) => setFilterFilialVenda(e.target.value)} className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <option value="">Todas</option>
+                    {filialOptions.map((c) => (<option key={c} value={c}>{c}</option>))}
+                  </select>
+                </div>
+
+                {/* Vendedor, Operacao, FreteFull, Montagem, Retorno */}
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Vendedor</label>
+                  <select value={filterSeller} onChange={(e) => setFilterSeller(e.target.value)} className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <option value="">Todos</option>
+                    {sellerOptions.map((c) => (<option key={c} value={c}>{c}</option>))}
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Operação</label>
+                  <select value={filterOperation} onChange={(e) => setFilterOperation(e.target.value)} className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <option value="">Todas</option>
+                    {operationOptions.map((c) => (<option key={c} value={c}>{c}</option>))}
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Departamento</label>
+                  <MultiSelect
+                    options={departmentOptions}
+                    selected={filterDepartment}
+                    onChange={setFilterDepartment}
+                    placeholder="Todos"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Subgrupo</label>
+                  <MultiSelect
+                    options={subgroupOptions}
+                    selected={filterSubgroup}
+                    onChange={setFilterSubgroup}
+                    placeholder="Todos"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Tipo Serviço</label>
+                  <select value={filterServiceType} onChange={(e) => setFilterServiceType(e.target.value)} className="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all">
+                    <option value="">Todos</option>
+                    <option value="normal">Venda Normal</option>
+                    <option value="troca">Troca</option>
+                    <option value="assistencia">Assistência</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Retorno</label>
+                  <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg">
+                    <input id="freturned" type="checkbox" className="h-4 w-4" checked={filterReturned} onChange={(e) => setFilterReturned(e.target.checked)} />
+                    <label htmlFor="freturned" className="text-sm text-gray-700">Apenas pedidos retornados</label>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Frete Full</label>
+                  <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg">
+                    <input id="ffull" type="checkbox" className="h-4 w-4" checked={filterFull} onChange={(e) => setFilterFull(e.target.checked)} />
+                    <label htmlFor="ffull" className="text-sm text-gray-700">Apenas pedidos Full</label>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-gray-500 uppercase">Tem Montagem</label>
+                  <div className="flex items-center gap-2 px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg">
+                    <input id="fmont" type="checkbox" className="h-4 w-4" checked={filterHasAssembly} onChange={(e) => setFilterHasAssembly(e.target.checked)} />
+                    <label htmlFor="fmont" className="text-sm text-gray-700">Apenas produtos com Montagem</label>
+                  </div>
+                </div>
+
+              </div>
+
+              <div className="flex justify-end mt-4 pt-4 border-t border-gray-100">
+                <button
+                  onClick={() => {
+                    setFilterCity([]);
+                    setFilterNeighborhood([]);
+                    setFilterDeadline('all');
+                    setFilterOrder('');
+                    setFilterClient('');
+                    setFilterSaleDateStart('');
+                    setFilterSaleDateEnd('');
+                    setFilterDeliveryDateStart('');
+                    setFilterDeliveryDateEnd('');
+                    setFilterForecastDateStart('');
+                    setFilterForecastDateEnd('');
+                    setFilterReturned(false);
+                    setFilterFull(false);
+                    setFilterServiceType('');
+                    setFilterDepartment([]);
+                    setFilterSubgroup([]);
+                    setFilterFilialVenda('');
+                    setFilterLocalEstocagem('');
+                    setFilterSeller('');
+                    setFilterOperation('');
+                    setFilterBrand('');
+                    setFilterFreightFull('');
+                    setFilterHasAssembly(false);
+                    setStrictLocal(false);
+                  }}
+                  className="text-sm text-red-600 hover:text-red-800 font-medium flex items-center"
+                >
+                  <X className="h-3 w-3 mr-1" /> Limpar filtros
+                </button>
+              </div>
+            </div>
+
+            {/* Action Bar */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+              <button
+                onClick={() => setShowLaunchModal(true)}
+                className="flex items-center justify-center px-4 py-3 rounded-xl border border-orange-200 text-orange-700 bg-orange-50 hover:bg-orange-100 font-bold transition-all shadow-sm hover:shadow"
+                title="Lançar Troca ou Assistência Avulsa"
+              >
+                <FilePlus className="h-5 w-5 mr-2" />
+                Lançamento Avulso
+              </button>
+
+              <button
+                onClick={() => loadData(false)}
+                disabled={loading}
+                className="flex items-center justify-center px-4 py-3 rounded-xl border border-gray-200 text-gray-700 bg-white hover:bg-gray-50 font-bold transition-all shadow-sm hover:shadow disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <RefreshCcw className={`h-5 w-5 mr-2 ${loading ? 'animate-spin' : ''}`} />
+                Recarregar Dados
+              </button>
+
+              <button
+                onClick={() => { try { localStorage.setItem('am_showCreateModal', '1'); } catch { } setShowCreateModal(true); }}
+                disabled={selectedOrders.size === 0}
+                className="flex items-center justify-center px-4 py-3 rounded-xl bg-blue-600 text-white hover:bg-blue-700 font-bold transition-all shadow-sm hover:shadow disabled:opacity-60 disabled:cursor-not-allowed disabled:shadow-none transform active:scale-95"
+              >
+                <Plus className="h-5 w-5 mr-2" />
+                Criar Rota ({selectedOrders.size})
+              </button>
+            </div>
+
+            {/* Orders Selection Card */}
+            <div ref={ordersSectionRef} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-100 bg-gray-50/50 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="flex items-center gap-2">
+                  <div className="bg-blue-100 p-2 rounded-lg">
+                    <Package className="h-5 w-5 text-blue-700" />
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-bold text-gray-900">Pedidos Disponíveis</h2>
+                    <p className="text-xs text-gray-500">{Object.values(filteredGroupedProducts).reduce((acc, list) => acc + (list?.length || 0), 0)} itens aguardando montagem</p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <label className="flex items-center px-3 py-2 bg-white border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50 transition-colors">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                      onChange={(e) => {
+                        if (e.currentTarget.checked) {
+                          const ids = new Set(Object.keys(filteredGroupedProducts));
+                          setSelectedOrders(ids);
+                        } else {
+                          setSelectedOrders(new Set());
+                        }
+                      }}
+                      checked={Object.keys(filteredGroupedProducts).length > 0 && selectedOrders.size === Object.keys(filteredGroupedProducts).length}
+                    />
+                    <span className="ml-2 text-sm font-medium text-gray-700">Selecionar Todos</span>
+                  </label>
+                  <button onClick={() => setShowColumnsModal(true)} className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition-colors" title="Configurar Colunas">
+                    <Settings className="h-5 w-5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Table Area */}
+              <div
+                ref={productsScrollRef}
+                onScroll={onProductsScroll}
+                onMouseDown={onProductsMouseDown}
+                onMouseMove={onProductsMouseMove}
+                onMouseUp={endProductsDrag}
+                onMouseLeave={endProductsDrag}
+                className={`overflow-auto max-h[500px] ${draggingProducts ? 'cursor-grabbing select-none' : 'cursor-grab'}`}
+              >
+                {Object.keys(filteredGroupedProducts).length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-16 text-center">
+                    <div className="bg-gray-50 p-4 rounded-full mb-4">
+                      <Package className="h-8 w-8 text-gray-400" />
+                    </div>
+                    <h3 className="text-lg font-medium text-gray-900">Nenhum pedido disponível</h3>
+                    <p className="text-gray-500 mt-1 max-w-sm">Todos os pedidos já foram montados ou não há produtos pendentes.</p>
+                  </div>
+                ) : (
+                  <table className="min-w-max w-full text-sm divide-y divide-gray-100">
+                    <thead className="bg-gray-50 sticky top-0 z-10 shadow-sm">
+                      <tr>
+                        <th className="px-4 py-3 w-10 text-left"></th>
+                        {columnsConf.filter(c => c.visible).map(c => (
+                          <th
+                            key={c.id}
+                            onClick={() => handleSort(c.id)}
+                            className="px-4 py-3 text-left font-semibold text-gray-600 uppercase text-xs tracking-wider cursor-pointer hover:bg-gray-100 transition-colors select-none"
+                          >
+                            <div className="flex items-center gap-1">
+                              {c.label}
+                              {sortColumn === c.id ? (
+                                sortDirection === 'asc' ? <ArrowUp className="h-3 w-3 text-blue-600" /> : <ArrowDown className="h-3 w-3 text-blue-600" />
+                              ) : (
+                                <ArrowUpDown className="h-3 w-3 text-gray-300 opacity-0 group-hover:opacity-100" />
+                              )}
+                            </div>
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-100 bg-white">
+                      {visibleRows.length === 0 ? (
+                        <tr><td colSpan={13} className="px-4 py-8 text-center text-gray-500">Nenhum pedido encontrado</td></tr>
+                      ) : (
+                        visibleRows.map((row) => {
+                          const waLink = (() => {
+                            const p = String(row.telefone || '').replace(/\D/g, '');
+                            const e164 = p ? (p.startsWith('55') ? p : '55' + p) : '';
+                            return e164 ? `https://wa.me/${e164}` : '';
+                          })();
+                          return (
+                            <tr key={row.key} className={`group hover:bg-gray-50 transition-colors ${row.selected ? 'bg-blue-50/60 hover:bg-blue-100/50' : ''}`}>
+                              <td className="px-4 py-3 cursor-pointer" onClick={() => toggleOrderSelection(row.orderId)}>
+                                <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${row.selected ? 'bg-blue-600 border-blue-600' : 'border-gray-300 bg-white'}`}>{row.selected && <CheckCircle2 className="h-3.5 w-3.5 text-white" />}</div>
+                              </td>
+                              {columnsConf.filter(c => c.visible).map(c => (
+                                <td key={c.id} className={`px-4 py-3 text-gray-700 ${['obsPublicas', 'obsInternas', 'endereco', 'produto'].includes(c.id) ? 'min-w-[200px] max-w-[300px] whitespace-normal leading-relaxed text-xs' : 'whitespace-nowrap'}`}>
+                                  {c.id === 'dataVenda' ? row.dataVenda :
+                                    c.id === 'entrega' ? row.entrega :
+                                      c.id === 'previsao' ? row.previsao :
+                                        c.id === 'pedido' ? row.pedido :
+                                          c.id === 'cliente' ? row.cliente :
+                                            c.id === 'telefone' ? (
+                                              <div className="flex items-center gap-2">
+                                                {waLink && (
+                                                  <a href={waLink} target="_blank" rel="noreferrer" className="p-1 rounded text-green-600 hover:bg-green-50" title="Abrir WhatsApp">
+                                                    <MessageSquare className="h-4 w-4" />
+                                                  </a>
+                                                )}
+                                                <span>{row.telefone}</span>
+                                              </div>
+                                            ) :
+                                              c.id === 'sinais' ? (
+                                                <div className="flex items-center gap-1 flex-wrap">
+                                                  {row.wasReturned && (() => {
+                                                    const knownReasons = ['Cliente ausente', 'Endereço incorreto / não localizado', 'Cliente sem contato', 'Cliente recusou / cancelou', 'Horário excedido'];
+                                                    const isKnownReason = knownReasons.some(r => row.returnReason.includes(r));
+                                                    const displayReason = isKnownReason ? row.returnReason : (row.returnReason ? 'Outro' : '');
+                                                    const fullText = row.returnReason + (row.returnObservation ? ` - ${row.returnObservation}` : '');
+                                                    return (
+                                                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-orange-100 text-orange-800 cursor-default" title={fullText || 'Pedido retornado'}>
+                                                        🔄 Retornado{displayReason ? ` · ${displayReason}` : ''}
+                                                      </span>
+                                                    );
+                                                  })()}
+                                                  {row.temFreteFull && (
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-yellow-100 text-yellow-800 border border-yellow-200" title="Frete Full - Prioridade na montagem">
+                                                      ⚡ Full
+                                                    </span>
+                                                  )}
+                                                  {row.prazoStatus === 'out' ? (
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">
+                                                      ⏰ Fora do Prazo
+                                                    </span>
+                                                  ) : row.prazoStatus === 'within' ? (
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">
+                                                      ✅ No Prazo
+                                                    </span>
+                                                  ) : (
+                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
+                                                      Sem Previsao
+                                                    </span>
+                                                  )}
+                                                </div>
+                                              ) :
+                                                c.id === 'produto' ? row.produto :
+                                                  c.id === 'sku' ? row.sku :
+                                                    c.id === 'obsPublicas' ? row.obsPublicas :
+                                                      c.id === 'obsInternas' ? row.obsInternas :
+                                                        c.id === 'cidade' ? row.cidade :
+                                                          c.id === 'bairro' ? row.bairro :
+                                                            c.id === 'endereco' ? row.endereco :
+                                                              c.id === 'department' ? row.department :
+                                                                c.id === 'subgroup' ? row.subgroup : '-'}
+                                </td>
+                              ))}
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+              <div className="px-6 py-3 border-t bg-gray-50 flex items-center justify-between">
+                <div className="text-xs text-gray-600">Mostrando {(ordersPage - 1) * ordersPageSize + (totalOrderRows ? 1 : 0)}–{Math.min(ordersPage * ordersPageSize, totalOrderRows)} de {totalOrderRows} itens</div>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setOrdersPage(Math.max(1, ordersPage - 1))} disabled={ordersPage <= 1} className="px-3 py-1.5 text-xs rounded-lg border bg-white disabled:opacity-50">Anterior</button>
+                  <select value={ordersPageSize} onChange={(e) => { setOrdersPageSize(Number(e.target.value)); setOrdersPage(1); }} className="text-xs border rounded px-2 py-1 bg-white">
+                    <option value={100}>100</option>
+                    <option value={200}>200</option>
+                    <option value={500}>500</option>
+                  </select>
+                  <button onClick={() => setOrdersPage(Math.min(totalPages, ordersPage + 1))} disabled={ordersPage >= totalPages} className="px-3 py-1.5 text-xs rounded-lg border bg-white disabled:opacity-50">Próxima</button>
+                </div>
+              </div>
+            </div>
+
+            {/* Routes List Section */}
+            <div ref={routesSectionRef} className="space-y-4">
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                    <Truck className="h-6 w-6 text-gray-700" />
+                    Rotas de Montagem Ativas
+                  </h2>
+                  <span className="bg-gray-100 text-gray-600 px-3 py-1 rounded-full text-xs font-bold">
+                    {assemblyRoutes.length}{hasMoreRoutes ? '+' : ''}
+                  </span>
+                </div>
+
+                {/* --- FILTER BAR --- */}
+                <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center justify-between bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
+                  {/* Date Filter */}
+                  <div className="flex items-center gap-2 overflow-x-auto w-full sm:w-auto pb-2 sm:pb-0">
+                    <div className="flex bg-gray-100 p-1 rounded-lg">
+                      <button
+                        onClick={() => setDateFilter('today')}
+                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${dateFilter === 'today' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                      >
+                        Hoje
+                      </button>
+                      <button
+                        onClick={() => setDateFilter('yesterday')}
+                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${dateFilter === 'yesterday' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                      >
+                        Ontem
+                      </button>
+                      <button
+                        onClick={() => setDateFilter('last7')}
+                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${dateFilter === 'last7' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                      >
+                        Últimos 7 dias
+                      </button>
+                      <button
+                        onClick={() => setDateFilter('all')}
+                        className={`px-3 py-1.5 rounded-md text-sm font-medium transition-all ${dateFilter === 'all' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+                      >
+                        Todos
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Status Filter */}
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-gray-500 uppercase">Status:</span>
+                    <div className="flex items-center gap-1">
+                      {[
+                        { id: 'pending', label: 'Pendente', color: 'bg-yellow-100 text-yellow-700 border-yellow-200' },
+                        { id: 'in_progress', label: 'Em Andamento', color: 'bg-blue-100 text-blue-700 border-blue-200' },
+                        { id: 'completed', label: 'Concluído', color: 'bg-green-100 text-green-700 border-green-200' }
+                      ].map(status => (
+                        <button
+                          key={status.id}
+                          onClick={() => {
+                            if (statusFilter.includes(status.id)) {
+                              setStatusFilter(prev => prev.filter(s => s !== status.id));
+                            } else {
+                              setStatusFilter(prev => [...prev, status.id]);
+                            }
+                          }}
+                          className={`px-3 py-1 rounded-full text-xs font-medium border transition-all ${statusFilter.includes(status.id) ? status.color + ' ring-2 ring-offset-1 ring-gray-200' : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-50'}`}
+                        >
+                          {status.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Search Filter */}
+                  <div className="flex items-center gap-2">
+                    <label className="hidden sm:block text-xs font-semibold text-gray-500 uppercase">Buscar:</label>
+                    <div className="relative">
+                      <Search className="absolute left-3 top-2 h-4 w-4 text-gray-400" />
+                      <input
+                        type="text"
+                        value={routeSearchQuery}
+                        onChange={(e) => setRouteSearchQuery(e.target.value)}
+                        placeholder="Rota, ID, Montador..."
+                        className="pl-9 pr-3 py-1.5 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all w-full sm:w-64"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                {assemblyRoutes.length === 0 ? (
+                  <div className="col-span-full bg-white rounded-xl border border-dashed border-gray-300 p-12 text-center">
+                    <div className="mx-auto w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-4">
+                      <Truck className="h-8 w-8 text-gray-400" />
+                    </div>
+                    <h3 className="text-lg font-medium text-gray-900">Nenhuma rota de montagem encontrada</h3>
+                    <p className="text-gray-500">Crie sua primeira rota de montagem selecionando pedidos acima.</p>
+                  </div>
+                ) : (
+                  assemblyRoutes.map(route => {
+                    const productsInRoute = assemblyInRoutes.filter(ap => ap.assembly_route_id === route.id);
+
+                    // Contar PRODUTOS (não pedidos) por status
+                    // NEW: Use kit logic for consolidated stats
+                    const stats = calculateAssemblyStats(productsInRoute);
+                    const totalProducts = stats.totalItems;
+                    const completed = stats.completedItems;
+                    const pending = stats.pendingItems;
+                    const returned = stats.returnedItems;
+                    /* Old Logic
+                    const totalProducts = productsInRoute.length;
+                    const completed = productsInRoute.filter(p => p.status === 'completed').length;
+                    const pending = productsInRoute.filter(p => p.status === 'pending' || p.status === 'assigned' || p.status === 'in_progress').length;
+                    const returned = productsInRoute.filter(p => p.status === 'cancelled').length;
+                    */
+                    console.log(`Route ${(route as any).route_code}: Total=${totalProducts}, Pending=${pending}, Returned=${returned}`);
+
+                    const statusColors = {
+                      pending: 'bg-yellow-50 text-yellow-700 border-yellow-200',
+                      in_progress: 'bg-blue-50 text-blue-700 border-blue-200',
+                      completed: 'bg-green-50 text-green-700 border-green-200'
+                    };
+                    const statusLabel = {
+                      pending: 'Pendente',
+                      in_progress: 'Em Rota',
+                      completed: 'Concluído'
+                    };
+
+                    const montador = montadores.find(m => m.id === route.assembler_id);
+                    const vehicle = vehicles.find(v => v.id === route.vehicle_id);
+                    const routeObservation = String((route as any).observations || '').trim();
+
+                    return (
+                      <div key={route.id} className="bg-white rounded-xl shadow-sm border border-gray-200 hover:shadow-md transition-shadow group flex flex-col">
+                        <div className="p-5 flex-1">
+                          <div className="flex flex-col items-center gap-2 mb-4">
+                            <div className="text-center">
+                              <h3 className="font-bold text-gray-900 text-lg group-hover:text-blue-600 transition-colors">{route.name}</h3>
+                              {(route as any).route_code && (
+                                <span className="inline-block px-2 py-0.5 bg-gray-100 text-gray-600 text-xs font-mono rounded mt-1">
+                                  {(route as any).route_code}
+                                </span>
+                              )}
+                              <p className="text-xs text-gray-500 mt-1 flex items-center justify-center">
+                                <Calendar className="h-3 w-3 mr-1" />
+                                {formatDate(route.created_at)}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border ${statusColors[route.status] || 'bg-gray-100'}`}>
+                                {statusLabel[route.status] || route.status}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="space-y-3 mb-6">
+                            <div className="flex items-center text-sm text-gray-600">
+                              <UserIcon className="h-4 w-4 mr-2 text-gray-400" />
+                              {montador?.name || montador?.email || 'Sem montador'}
+                            </div>
+                            {vehicle && (
+                              <div className="flex items-center text-sm text-gray-600">
+                                <Truck className="h-4 w-4 mr-2 text-gray-400" />
+                                {vehicle.model} ({vehicle.plate})
+                              </div>
+                            )}
+                            {route.deadline && (
+                              <div className="flex items-center text-sm text-gray-600">
+                                <Calendar className="h-4 w-4 mr-2 text-gray-400" />
+                                Prazo: {formatDate(route.deadline)}
+                              </div>
+                            )}
+                            {routeObservation && (
+                              <div className="flex items-start text-sm text-gray-600">
+                                <MessageSquare className="h-4 w-4 mr-2 mt-0.5 text-gray-400 shrink-0" />
+                                <span className="leading-snug break-words whitespace-pre-wrap" title={routeObservation}>
+                                  {routeObservation}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Mini Stats */}
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-2">
+                            <div className="bg-gray-50 rounded-lg p-2 text-center">
+                              <span className="block text-lg font-bold text-gray-900">{totalProducts}</span>
+                              <span className="text-[10px] uppercase text-gray-500 font-bold">Total</span>
+                            </div>
+                            <div className="bg-green-50 rounded-lg p-2 text-center">
+                              <span className="block text-lg font-bold text-green-700">{completed}</span>
+                              <span className="text-[10px] uppercase text-green-600 font-bold">Concluídos</span>
+                            </div>
+                            <div className="bg-yellow-50 rounded-lg p-2 text-center">
+                              <span className="block text-lg font-bold text-yellow-700">{pending}</span>
+                              <span className="text-[10px] uppercase text-yellow-600 font-bold">Pendentes</span>
+                            </div>
+                            <div className="bg-red-50 rounded-lg p-2 text-center">
+                              <span className="block text-lg font-bold text-red-700">{returned}</span>
+                              <span className="text-[10px] uppercase text-red-600 font-bold">Retornados</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-4 border-t border-gray-100 bg-gray-50/50 rounded-b-xl flex gap-3">
+                          <button
+                            onClick={async () => {
+                              try { localStorage.setItem('am_selectedRouteId', String(route.id)); localStorage.setItem('am_showRouteModal', '1'); } catch { }
+
+                              // Check if products for this route are already loaded
+                              const existingProducts = assemblyInRoutes.filter(ap => String(ap.assembly_route_id) === String(route.id));
+
+                              if (existingProducts.length === 0) {
+                                // Products not loaded - fetch from database (same logic as auto-open)
+                                try {
+                                  const { data: routeWithProducts, error } = await supabase
+                                    .from('assembly_routes')
+                                    .select(`
+                                      *,
+                                      assembler:assembler_id (id, name),
+                                      vehicle:vehicle_id (id, model, plate),
+                                      assembly_products (
+                                        id, order_id, product_name, product_sku, status, assembly_route_id, 
+                                        created_at, updated_at, was_returned, completion_date, returned_at, observations,
+                                        order:order_id (
+                                          id, order_id_erp, customer_name, customer_cpf, phone, address_json, items_json, 
+                                          raw_json, data_venda, previsao_entrega, previsao_montagem, department, product_group, product_subgroup
+                                        )
+                                      )
+                                    `)
+                                    .eq('id', route.id)
+                                    .single();
+
+                                  if (!error && routeWithProducts) {
+                                    const formattedProducts = (routeWithProducts.assembly_products || []).map((ap: any) => ({
+                                      ...ap,
+                                      order_id_erp: ap.order?.order_id_erp,
+                                      customer_name: ap.order?.customer_name,
+                                      customer_address: ap.order?.address_json ?
+                                        `${ap.order.address_json.street || ''}, ${ap.order.address_json.neighborhood || ''} - ${ap.order.address_json.city || ''}` : ''
+                                    }));
+
+                                    // Add products to global state
+                                    setAssemblyInRoutes(prev => {
+                                      const others = prev.filter(p => String(p.assembly_route_id) !== String(route.id));
+                                      return [...others, ...formattedProducts];
+                                    });
+
+                                    // Set route with products
+                                    const formattedRoute = {
+                                      ...routeWithProducts,
+                                      assembler_name: routeWithProducts.assembler?.name,
+                                      vehicle_model: routeWithProducts.vehicle?.model,
+                                      vehicle_plate: routeWithProducts.vehicle?.plate,
+                                      assembly_products: formattedProducts
+                                    };
+                                    setSelectedRoute(formattedRoute as any);
+                                    setShowRouteModal(true);
+                                    return;
+                                  }
+                                } catch (err) {
+                                  console.error('Error fetching route products:', err);
+                                }
+                              }
+
+                              // Fallback: use existing route data
+                              setSelectedRoute(route);
+                              setShowRouteModal(true);
+                            }}
+                            className="flex-1 inline-flex items-center justify-center px-4 py-2 bg-white border border-gray-300 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-50 transition-colors shadow-sm"
+                          >
+                            <Eye className="h-4 w-4 mr-2" /> Detalhes
+                          </button>
+                          <button
+                            onClick={async () => {
+                              try {
+                                const products = assemblyInRoutes.filter(ap => ap.assembly_route_id === route.id);
+                                const orders = products.map(p => p.order).filter(Boolean) as any[];
+
+                                const routeOrders = products.map((p, idx) => ({
+                                  id: String(p.id),
+                                  route_id: String(route.id),
+                                  order_id: String(p.order_id),
+                                  sequence: idx + 1,
+                                  status: 'pending',
+                                  created_at: route.created_at,
+                                  updated_at: route.updated_at
+                                })) as any[];
+
+                                const routeData: any = {
+                                  id: route.id,
+                                  name: route.name,
+                                  driver_id: '',
+                                  vehicle_id: '',
+                                  conferente: '',
+                                  observations: route.observations,
+                                  status: route.status as any,
+                                  created_at: route.created_at,
+                                  updated_at: route.updated_at,
+                                  route_code: (route as any).route_code,
+                                };
+
+                                const data = {
+                                  route: routeData,
+                                  routeOrders,
+                                  driver: { id: '', user_id: '', cpf: '', active: true, name: '—', user: { id: '', email: '', name: '—', role: 'driver', created_at: new Date().toISOString() } } as any,
+                                  vehicle: undefined,
+                                  orders: orders as any,
+                                  generatedAt: new Date().toISOString(),
+                                  assemblyInstallerName: montador?.name || montador?.email || '—',
+                                  assemblyVehicleModel: vehicle?.model || '',
+                                  assemblyVehiclePlate: vehicle?.plate || '',
+                                };
+
+                                const pdfBytes = await DeliverySheetGenerator.generateDeliverySheet(data, 'Rota de Montagem');
+                                DeliverySheetGenerator.openPDFInNewTab(pdfBytes);
+                              } catch (e) {
+                                console.error(e);
+                                toast.error('Erro ao gerar PDF da rota de montagem');
+                              }
+                            }}
+                            className="flex-1 inline-flex items-center justify-center px-4 py-2 bg-blue-50 border border-blue-100 text-blue-700 text-sm font-medium rounded-lg hover:bg-blue-100 transition-colors"
+                          >
+                            <FileText className="h-4 w-4 mr-2" /> PDF
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          </>)}
+      </div>
+
+      {/* --- MODALS --- */}
+
+      {/* Create Route Modal */}
+      {
+        showCreateModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50 flex-shrink-0">
+                <h3 className="text-lg font-bold text-gray-900">Nova Rota de Montagem</h3>
+                <button onClick={() => { try { localStorage.setItem('am_showCreateModal', '0'); } catch { } setShowCreateModal(false); }} className="text-gray-400 hover:text-gray-600"><X className="h-5 w-5" /></button>
+              </div>
+              <div className="p-6 space-y-6 overflow-y-auto flex-1">
+                {/* Select existing route or create new */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">Adicionar a rota de montagem existente?</label>
+                  <select
+                    value={selectedExistingRoute}
+                    onChange={(e) => setSelectedExistingRoute(e.target.value)}
+                    className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                  >
+                    <option value="">Nao, criar nova rota de montagem</option>
+                    {allPendingRoutes
+                      .map(r => (
+                        <option key={r.id} value={r.id}>{getExistingRouteOptionLabel(r)}</option>
+                      ))
+                    }
+                  </select>
+                  {selectedExistingRoute && (
+                    <p className="mt-2 text-xs text-gray-500">
+                      Rota selecionada: {
+                        (() => {
+                          const selected = allPendingRoutes.find(r => String(r.id) === String(selectedExistingRoute));
+                          if (!selected) return selectedExistingRoute;
+                          return getExistingRouteOptionLabel(selected);
+                        })()
+                      }
+                    </p>
+                  )}
+                </div>
+
+                {/* Only show name field if creating new route */}
+                {!selectedExistingRoute && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Rota Cadastrada <span className="text-red-500">*</span></label>
+                    <select
+                      value={selectedDeliveryRouteId}
+                      onChange={(e) => setSelectedDeliveryRouteId(e.target.value)}
+                      className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    >
+                      <option value="">Selecione...</option>
+                      {deliveryRouteCatalog.map(route => (
+                        <option key={route.id} value={route.id}>{route.name}</option>
+                      ))}
+                    </select>
+                    {deliveryRouteCatalog.length === 0 && (
+                      <p className="mt-2 text-xs text-amber-600">
+                        Nenhuma rota cadastrada em Usuarios e Equipes &gt; Rotas.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {/* Only show these fields if creating new route */}
+                {!selectedExistingRoute && (
+                  <>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">Montador <span className="text-red-500">*</span></label>
+                        <select
+                          value={selectedMontador}
+                          onChange={(e) => setSelectedMontador(e.target.value)}
+                          className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        >
+                          <option value="">Selecione...</option>
+                          {montadores.map(m => <option key={m.id} value={m.id}>{m.name || m.email}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-2">Veículo <span className="text-red-500">*</span></label>
+                        <select
+                          value={selectedVehicle}
+                          onChange={(e) => setSelectedVehicle(e.target.value)}
+                          className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        >
+                          <option value="">Selecione...</option>
+                          {vehicles.map(v => <option key={v.id} value={v.id}>{v.plate} - {v.model}</option>)}
+                        </select>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Prazo de Conclusão <span className="text-red-500">*</span></label>
+                      <input
+                        type="date"
+                        value={deadline}
+                        onChange={(e) => setDeadline(e.target.value)}
+                        className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Observações</label>
+                      <textarea
+                        value={observations}
+                        onChange={(e) => setObservations(e.target.value)}
+                        rows={3}
+                        placeholder="Observações sobre a montagem..."
+                        className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                  </>
+                )}
+
+                <div className="bg-blue-50 p-4 rounded-xl flex items-center justify-between">
+                  <span className="text-blue-900 font-medium">Pedidos Selecionados</span>
+                  <span className="bg-blue-200 text-blue-800 px-3 py-1 rounded-lg font-bold">{selectedOrders.size}</span>
+                </div>
+              </div>
+              <div className="px-6 py-4 border-t border-gray-100 bg-gray-50 flex justify-end gap-3 flex-shrink-0">
+                <button onClick={() => setShowCreateModal(false)} className="px-6 py-2.5 rounded-xl border border-gray-300 text-gray-700 font-medium hover:bg-white transition-colors">Cancelar</button>
+                <button
+                  onClick={() => createAssemblyRoute()}
+                  disabled={saving || (selectedOrders.size === 0) || (!selectedExistingRoute && !selectedDeliveryRouteId)}
+                  className="px-6 py-2.5 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow-lg shadow-blue-200 disabled:opacity-50 disabled:shadow-none transition-all transform active:scale-95"
+                >
+                  {saving ? 'Salvando...' : (selectedExistingRoute ? 'Adicionar a Rota de Montagem' : 'Confirmar Rota de Montagem')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* Columns Modal */}
+      {
+        showColumnsModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden">
+              <div className="px-5 py-4 border-b border-gray-100 flex justify-between items-center">
+                <h3 className="font-bold text-gray-900">Configurar Colunas</h3>
+                <button onClick={() => setShowColumnsModal(false)}><X className="h-5 w-5 text-gray-400" /></button>
+              </div>
+              <div className="p-2 overflow-y-auto max-h-[60vh]">
+                {columnsConf.map((c, idx) => (
+                  <div key={c.id} className="flex items-center justify-between p-3 hover:bg-gray-50 rounded-lg group">
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={c.visible}
+                        onChange={() => {
+                          const newCols = [...columnsConf];
+                          newCols[idx].visible = !newCols[idx].visible;
+                          setColumnsConf(newCols);
+                        }}
+                        className="h-4 w-4 text-blue-600 rounded border-gray-300 focus:ring-blue-500"
+                      />
+                      <span className="text-gray-700">{c.label}</span>
+                    </label>
+                    <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button
+                        onClick={() => {
+                          if (idx === 0) return;
+                          const newCols = [...columnsConf];
+                          [newCols[idx - 1], newCols[idx]] = [newCols[idx], newCols[idx - 1]];
+                          setColumnsConf(newCols);
+                        }}
+                        className="p-1 hover:bg-gray-200 rounded"
+                      ><ChevronUp className="h-4 w-4" /></button>
+                      <button
+                        onClick={() => {
+                          if (idx === columnsConf.length - 1) return;
+                          const newCols = [...columnsConf];
+                          [newCols[idx + 1], newCols[idx]] = [newCols[idx], newCols[idx + 1]];
+                          setColumnsConf(newCols);
+                        }}
+                        className="p-1 hover:bg-gray-200 rounded"
+                      ><ChevronDown className="h-4 w-4" /></button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="p-4 border-t border-gray-100 bg-gray-50 text-right">
+                <button
+                  onClick={async () => {
+                    if (authUser?.id) {
+                      const success = await saveUserPreference(authUser.id, 'am_columns_conf', columnsConf);
+                      if (success) {
+                        toast.success('Configuração de colunas salva com sucesso!');
+                      } else {
+                        toast.error('Erro ao salvar configuração. Tente novamente.');
+                      }
+                    } else {
+                      // Fallback to localStorage if not authenticated
+                      localStorage.setItem('am_columns_conf', JSON.stringify(columnsConf));
+                      toast.success('Configuração salva localmente.');
+                    }
+                    setShowColumnsModal(false);
+                  }}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700"
+                >
+                  Salvar Configuração
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* Route Details Modal */}
+      {
+        showRouteModal && selectedRoute && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in zoom-in-95 duration-200">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-6xl max-h-[90vh] flex flex-col overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-100 bg-gray-50">
+                {/* Header with Edit Toggle */}
+                <div className="flex justify-between items-start">
+                  {!isEditingRoute ? (
+                    <div>
+                      <h2 className="text-xl font-bold text-gray-900">
+                        {selectedRoute.name}
+                        {(selectedRoute as any).route_code && (
+                          <span className="ml-2 px-2 py-0.5 bg-gray-100 text-gray-600 text-sm font-mono rounded">
+                            {(selectedRoute as any).route_code}
+                          </span>
+                        )}
+                      </h2>
+                      <p className="text-sm text-gray-500">
+                        {selectedRoute.status === 'pending' ? 'Pendente' : selectedRoute.status === 'in_progress' ? 'Em Rota' : 'Concluído'}
+                        • {formatDate(selectedRoute.created_at)}
+                        {(selectedRoute as any).assembler_id && (() => {
+                          const m = montadores.find(m => m.id === (selectedRoute as any).assembler_id);
+                          return m ? ` • Montador: ${m.name || m.email}` : '';
+                        })()}
+                        {(selectedRoute as any).vehicle_id && (() => {
+                          const v = vehicles.find(v => v.id === (selectedRoute as any).vehicle_id);
+                          return v ? ` • ${v.model} (${v.plate})` : '';
+                        })()}
+                      </p>
+                      {selectedRoute.observations && (
+                        <p className="text-sm text-gray-500 mt-1">Obs: {selectedRoute.observations}</p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="flex-1 mr-4">
+                      <h3 className="text-lg font-bold text-gray-900 mb-3">Editar Rota de Montagem</h3>
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Nome da Rota de Montagem *</label>
+                          <select
+                            value={editSelectedDeliveryRouteId}
+                            onChange={(e) => setEditSelectedDeliveryRouteId(e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                          >
+                            <option value="">Selecione...</option>
+                            {deliveryRouteCatalog.map(route => (
+                              <option key={route.id} value={route.id}>{route.name}</option>
+                            ))}
+                          </select>
+                          {deliveryRouteCatalog.length === 0 && (
+                            <p className="mt-1 text-xs text-amber-600">Nenhuma rota cadastrada em Usuarios e Equipes &gt; Rotas.</p>
+                          )}
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Montador *</label>
+                          <select
+                            value={editRouteMontador}
+                            onChange={(e) => setEditRouteMontador(e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                          >
+                            <option value="">Selecione um montador</option>
+                            {montadores.map(m => (
+                              <option key={m.id} value={m.id}>{m.name || m.email}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Veículo</label>
+                          <select
+                            value={editRouteVehicle}
+                            onChange={(e) => setEditRouteVehicle(e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                          >
+                            <option value="">Selecione um veículo</option>
+                            {vehicles.map(v => (
+                              <option key={v.id} value={v.id}>{v.model} ({v.plate})</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Prazo</label>
+                          <input
+                            type="date"
+                            value={editRouteDeadline}
+                            onChange={(e) => setEditRouteDeadline(e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                          />
+                        </div>
+                        <div className="md:col-span-2">
+                          <label className="block text-xs font-medium text-gray-700 mb-1">Observações</label>
+                          <input
+                            type="text"
+                            value={editRouteObservations}
+                            onChange={(e) => setEditRouteObservations(e.target.value)}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                            placeholder="Observações sobre a rota"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2 flex-shrink-0">
+                    {/* Edit / Save / Cancel buttons */}
+                    {!isEditingRoute ? (
+                      <button
+                        onClick={async () => {
+                          const r = selectedRoute as any;
+                          const catalog = await fetchDeliveryRouteCatalog();
+                          const list = (catalog && catalog.length > 0) ? catalog : deliveryRouteCatalog;
+                          const matchedRoute = list.find((route) =>
+                            String(route.name || '').trim().toLowerCase() === String(r.name || '').trim().toLowerCase()
+                          );
+                          setEditSelectedDeliveryRouteId(matchedRoute ? String(matchedRoute.id) : '');
+                          setEditRouteMontador(r.assembler_id || '');
+                          setEditRouteVehicle(r.vehicle_id || '');
+                          setEditRouteDeadline(r.deadline ? r.deadline.split('T')[0] : '');
+                          setEditRouteObservations(r.observations || '');
+                          setIsEditingRoute(true);
+                        }}
+                        disabled={(selectedRoute as any).status === 'completed'}
+                        className="inline-flex items-center px-3 py-2 border border-yellow-200 shadow-sm text-sm font-medium rounded-lg text-yellow-700 bg-yellow-50 hover:bg-yellow-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Pencil className="h-4 w-4 mr-2" /> Editar
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          onClick={() => saveRouteEdits()}
+                          disabled={savingEdit || !editSelectedDeliveryRouteId || !editRouteMontador}
+                          className="inline-flex items-center px-3 py-2 border border-green-200 shadow-sm text-sm font-medium rounded-lg text-green-700 bg-green-50 hover:bg-green-100 disabled:opacity-50"
+                        >
+                          <Save className="h-4 w-4 mr-2" /> {savingEdit ? 'Salvando...' : 'Salvar'}
+                        </button>
+                        <button
+                          onClick={() => setIsEditingRoute(false)}
+                          disabled={savingEdit}
+                          className="inline-flex items-center px-3 py-2 border border-gray-200 shadow-sm text-sm font-medium rounded-lg text-gray-700 bg-gray-50 hover:bg-gray-100 disabled:opacity-50"
+                        >
+                          Cancelar
+                        </button>
+                      </>
+                    )}
+                    <button
+                      onClick={() => setShowPdfSortModal(true)}
+                      className="inline-flex items-center px-3 py-2 border border-blue-200 shadow-sm text-sm font-medium rounded-lg text-blue-700 bg-blue-50 hover:bg-blue-100"
+                    >
+                      <FileText className="h-4 w-4 mr-2" /> PDF
+                    </button>
+                    {(selectedRoute as any).status === 'pending' && (
+                      <button
+                        onClick={async () => {
+                          if (!selectedRoute || startingRoute) return;
+                          setStartingRoute(true);
+                          try {
+                            const { error } = await supabase.from('assembly_routes').update({ status: 'in_progress' }).eq('id', selectedRoute.id);
+                            if (error) throw error;
+                            const updated = { ...selectedRoute, status: 'in_progress' } as any;
+                            setSelectedRoute(updated);
+                            toast.success('Rota iniciada com sucesso!');
+                            loadData(true);
+                          } catch (e) {
+                            console.error(e);
+                            toast.error('Erro ao iniciar rota');
+                          } finally {
+                            setStartingRoute(false);
+                          }
+                        }}
+                        disabled={startingRoute}
+                        className="inline-flex items-center px-3 py-2 border border-blue-200 shadow-sm text-sm font-medium rounded-lg text-blue-700 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Clock className="h-4 w-4 mr-2" /> Iniciar Rota
+                      </button>
+                    )}
+                    <button
+                      onClick={async () => {
+                        if (!selectedRoute) return;
+                        setWaSending(true);
+                        try {
+                          const route = selectedRoute as any;
+                          const produtosDaRota = assemblyInRoutes.filter(p => p.assembly_route_id === route.id);
+                          const mapByOrder = new Map<string, any>();
+                          produtosDaRota.forEach((p: any) => {
+                            const o = p.order || {};
+                            if (!o.id) return;
+                            if (!mapByOrder.has(o.id)) {
+                              const addr = o.address_json || {};
+                              const num = addr.number ? `, ${addr.number}` : '';
+                              const endereco_completo = `${addr.street || ''}${num} - ${addr.neighborhood || ''}${addr.city ? ', ' + addr.city : ''}`.trim();
+                              mapByOrder.set(o.id, {
+                                lancamento_venda: Number(o.order_id_erp || o.id || 0),
+                                cliente_nome: String(o.customer_name || ''),
+                                cliente_celular: String(o.phone || o.raw_json?.cliente_celular || ''),
+                                endereco_completo,
+                                produtos: [] as string[],
+                              });
+                            }
+                            const entry = mapByOrder.get(o.id);
+                            const sku = String(p.product_sku || '');
+                            const nome = String(p.product_name || '');
+                            entry.produtos.push(`${sku} - ${nome}`);
+                          });
+                          const contatos = Array.from(mapByOrder.values()).map((c: any) => ({
+                            lancamento_venda: c.lancamento_venda,
+                            cliente_nome: c.cliente_nome,
+                            cliente_celular: c.cliente_celular,
+                            endereco_completo: c.endereco_completo,
+                            produtos: (c.produtos || []).join(', '),
+                          }));
+                          if (contatos.length === 0) { toast.error('Nenhum pedido para envio'); setWaSending(false); return; }
+                          let webhookUrl = import.meta.env.VITE_WEBHOOK_WHATSAPP_URL as string | undefined;
+                          if (!webhookUrl) {
+                            try {
+                              const { data } = await supabase.from('webhook_settings').select('url').eq('key', 'envia_mensagem').eq('active', true).single();
+                              webhookUrl = data?.url || 'https://n8n.lojaodosmoveis.shop/webhook-test/envia_mensagem';
+                            } catch {
+                              webhookUrl = 'https://n8n.lojaodosmoveis.shop/webhook-test/envia_mensagem';
+                            }
+                          }
+                          const payload = { contatos, tipo_de_romaneio: 'montagem' } as any;
+                          try {
+                            await fetch(String(webhookUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                          } catch {
+                            const fd = new FormData();
+                            for (const c of contatos) fd.append('contatos[]', JSON.stringify(c));
+                            fd.append('tipo_de_romaneio', 'montagem');
+                            await fetch(String(webhookUrl), { method: 'POST', body: fd });
+                          }
+                          toast.success('WhatsApp solicitado');
+                        } catch (e) {
+                          console.error(e);
+                          toast.error('Erro ao enviar WhatsApp');
+                        } finally {
+                          setWaSending(false);
+                        }
+                      }}
+                      disabled={waSending || (selectedRoute as any).status === 'completed'}
+                      className="inline-flex items-center px-3 py-2 border border-green-200 shadow-sm text-sm font-medium rounded-lg text-green-700 bg-green-50 hover:bg-green-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Enviar cliente
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (!selectedRoute) return;
+                        setGroupSending(true);
+                        try {
+                          const route = selectedRoute as any;
+                          const produtos = assemblyInRoutes.filter(p => p.assembly_route_id === route.id);
+                          const documentos = Array.from(new Set(produtos.map((p: any) => String(p.order?.order_id_erp || '')).filter(Boolean)));
+                          if (documentos.length === 0) { toast.error('Nenhum número de lançamento encontrado'); setGroupSending(false); return; }
+                          const assemblerId = (route as any).assembler_id;
+                          let assemblerName = '';
+                          if (assemblerId) {
+                            const m = montadores.find(m => m.id === assemblerId);
+                            assemblerName = m?.name || m?.email || '';
+                          }
+
+                          // Na montagem não tem equipe, enviar sempre o nome do montador
+                          // Usar variável 'finalName' para manter consistência com o bloco anterior se necessário, ou usar assemblerName direto
+                          const finalName = assemblerName;
+
+                          let vehicle_text = '';
+                          const vehicleId = (route as any).vehicle_id;
+                          if (vehicleId) {
+                            const v = vehicles.find(v => v.id === vehicleId);
+                            if (v) vehicle_text = `${String(v.model || '')}${v.plate ? ' | ' + String(v.plate) : ''}`;
+                          }
+                          const route_name = String(route.name || '');
+                          const status = String(route.status || '');
+                          const observations = String(route.observations || '');
+                          let webhookUrl = import.meta.env.VITE_WEBHOOK_ENVIA_GRUPO_URL as string | undefined;
+                          if (!webhookUrl) {
+                            try {
+                              const { data } = await supabase.from('webhook_settings').select('url').eq('key', 'envia_grupo').eq('active', true).single();
+                              webhookUrl = data?.url || 'https://n8n.lojaodosmoveis.shop/webhook-test/envia_grupo';
+                            } catch {
+                              webhookUrl = 'https://n8n.lojaodosmoveis.shop/webhook-test/envia_grupo';
+                            }
+                          }
+                          // Envia o nome do montador no campo driver_name e route_code como route_id
+                          const payload = { route_id: (route as any).route_code, route_name, driver_name: finalName, conferente: finalName, documentos, status, vehicle: vehicle_text, observations, tipo_de_romaneio: 'montagem' } as any;
+                          try {
+                            const resp = await fetch(String(webhookUrl), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                            if (!resp.ok) {
+                              const text = await resp.text();
+                              if (resp.status === 404 && text.includes('envia_grupo')) {
+                                toast.error('Webhook não está ativo.');
+                              } else {
+                                toast.error('Falha ao enviar informativo');
+                              }
+                              setGroupSending(false);
+                              return;
+                            }
+                          } catch {
+                            const fd = new FormData();
+                            fd.append('route_id', (route as any).route_code);
+                            fd.append('route_name', route_name);
+                            fd.append('driver_name', finalName);
+                            fd.append('conferente', finalName);
+                            fd.append('status', status);
+                            fd.append('vehicle', vehicle_text);
+                            fd.append('observations', observations);
+                            fd.append('tipo_de_romaneio', 'montagem');
+                            for (const d of documentos) fd.append('documentos[]', d);
+                            await fetch(String(webhookUrl), { method: 'POST', body: fd });
+                          }
+                          toast.success('Rota enviada ao grupo');
+                        } catch (e) {
+                          console.error(e);
+                          toast.error('Erro ao enviar rota em grupo');
+                        } finally {
+                          setGroupSending(false);
+                        }
+                      }}
+                      disabled={groupSending || (selectedRoute as any).status === 'completed'}
+                      className="inline-flex items-center px-3 py-2 border border-green-200 shadow-sm text-sm font-medium rounded-lg text-green-700 bg-green-50 hover:bg-green-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      Enviar grupo
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (!selectedRoute) return;
+                        const toastId = toast.loading('Gerando resumo...');
+                        try {
+                          const route = selectedRoute as any;
+                          const products = assemblyInRoutes.filter(ap => ap.assembly_route_id === route.id);
+
+                          // Get Installer Name
+                          let installerName = '';
+                          if (route.assembler_id) {
+                            const m = montadores.find(u => u.id === route.assembler_id);
+                            installerName = m ? (m.name || m.email || '') : '';
+                          }
+
+                          // Get Vehicle Info
+                          let vehicleInfo = '';
+                          if (route.vehicle_id) {
+                            const v = vehicles.find(veh => veh.id === route.vehicle_id);
+                            vehicleInfo = v ? `${v.model} (${v.plate})` : '';
+                          }
+
+
+                          // Helper to clean strings for PDF generation (removes Tabs and other control chars)
+                          const sanitize = (str: any) => {
+                            if (!str) return '';
+                            return String(str).replace(/[\t\u0000-\u001F]+/g, ' ').trim();
+                          };
+
+                          // Deep sanitize the route object for the report
+                          const sanitizedRoute = {
+                            ...route,
+                            name: sanitize(route.name),
+                            observations: sanitize(route.observations),
+                            assembler_name: sanitize((route as any).assembler_name), // if present
+                            vehicle_model: sanitize((route as any).vehicle_model),   // if present
+                            vehicle_plate: sanitize((route as any).vehicle_plate)    // if present
+                          };
+
+                          // Deep sanitize products
+                          const sanitizedProducts = products.map((p: any) => {
+                            const order = p.order || {};
+                            const addr = order.address_json || {};
+                            // Clone and sanitize deep properties as needed by the report generator
+                            return {
+                              ...p,
+                              product_name: sanitize(p.product_name),
+                              product_sku: sanitize(p.product_sku),
+                              customer_name: sanitize(p.customer_name),
+                              observations: sanitize(p.observations),
+                              technical_notes: sanitize(p.technical_notes),
+                              // Ensure nested order data is also clean if used
+                              order: {
+                                ...order,
+                                customer_name: sanitize(order.customer_name),
+                                order_id_erp: sanitize(order.order_id_erp),
+                                phone: sanitize(order.phone),
+                                address_json: {
+                                  ...addr,
+                                  street: sanitize(addr.street),
+                                  neighborhood: sanitize(addr.neighborhood),
+                                  city: sanitize(addr.city),
+                                  complement: sanitize(addr.complement)
+                                }
+                              }
+                            };
+                          });
+
+                          // Use existing products data which already has 'order' details populated from loadData
+                          const pdfBytes = await AssemblyReportGenerator.generateAssemblyReport({
+                            route: sanitizedRoute,
+                            products: sanitizedProducts,
+                            installerName: sanitize(installerName),
+                            supervisorName: '',
+                            vehicleInfo: sanitize(vehicleInfo),
+                            generatedAt: new Date().toISOString()
+                          });
+
+                          const blob = new Blob([pdfBytes as any], { type: 'application/pdf' });
+                          const url = URL.createObjectURL(blob);
+                          window.open(url, '_blank');
+                          toast.success('Resumo gerado!', { id: toastId });
+                        } catch (error) {
+                          console.error('Error generating assembly report:', error);
+                          toast.error('Erro ao gerar resumo da montagem', { id: toastId });
+                        }
+                      }}
+                      disabled={(selectedRoute as any).status !== 'completed' && (selectedRoute as any).status !== 'in_progress' && (selectedRoute as any).status !== 'pending'}
+                      className="inline-flex items-center px-3 py-2 border border-purple-200 shadow-sm text-sm font-medium rounded-lg text-purple-700 bg-purple-50 hover:bg-purple-100"
+                    >
+                      <ClipboardCheck className="h-4 w-4 mr-2" /> Resumo
+                    </button>
+                    <button onClick={() => { try { localStorage.setItem('am_showRouteModal', '0'); } catch { } setShowRouteModal(false); }} className="p-2 hover:bg-gray-200 rounded-full text-gray-500"><X className="h-6 w-6" /></button>
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-6 bg-gray-50 max-h-[65vh]">
+                  {/* Orders grouped */}
+                  <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-gray-50 border-b border-gray-100">
+                        <tr>
+                          <th className="px-4 py-3 text-left font-semibold text-gray-600">Pedido</th>
+                          <th className="px-4 py-3 text-left font-semibold text-gray-600">Cliente / Endereço</th>
+                          <th className="px-4 py-3 text-left font-semibold text-gray-600">Status</th>
+                          <th className="px-4 py-3 text-right font-semibold text-gray-600">Ações</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-100">
+                        {(() => {
+                          const byOrder: Record<string, AssemblyProductWithDetails[]> = {};
+
+                          // Use products directly from the route object if available (e.g. from auto-open),
+                          // otherwise fallback to filtering the global list.
+                          const productsSource = ((selectedRoute as any).assembly_products && (selectedRoute as any).assembly_products.length > 0)
+                            ? (selectedRoute as any).assembly_products
+                            : assemblyInRoutes.filter(ap => String(ap.assembly_route_id) === String(selectedRoute.id));
+
+                          productsSource.forEach((ap: any) => {
+                            const k = String(ap.order_id);
+                            if (!byOrder[k]) byOrder[k] = [];
+                            byOrder[k].push(ap);
+                          });
+                          const statusColors = {
+                            pending: 'bg-yellow-100 text-yellow-800 border-yellow-200',
+                            completed: 'bg-green-100 text-green-800 border-green-200',
+                            cancelled: 'bg-red-100 text-red-800 border-red-200'
+                          } as Record<string, string>;
+                          const statusLabel = {
+                            pending: 'Pendente',
+                            completed: 'Concluído',
+                            cancelled: 'Retornado'
+                          } as Record<string, string>;
+                          return Object.entries(byOrder).map(([orderId, list]) => {
+                            const order = list[0]?.order || {} as any;
+                            const addr = order.address_json || {};
+                            const statuses = list.map(i => i.status);
+                            const derived = statuses.every(s => s === 'cancelled') ? 'cancelled' : (statuses.every(s => s === 'completed') ? 'completed' : 'pending');
+
+                            // Get timestamp from first item (assuming batch update essentially gives same time, or we take latest)
+                            const firstItem = list[0];
+                            const timestamp = firstItem?.completion_date || firstItem?.returned_at;
+                            const formattedTime = timestamp ? new Date(timestamp).toLocaleString('pt-BR') : '-';
+
+                            return (
+                              <tr key={orderId} className="hover:bg-gray-50">
+                                <td className="px-4 py-3 font-medium">{order.order_id_erp || orderId}</td>
+                                <td className="px-4 py-3">
+                                  <div className="text-sm text-gray-900">{order.customer_name}</div>
+                                  <div className="text-xs text-gray-500 flex items-center gap-1">
+                                    <MapPin className="h-3 w-3" />
+                                    {addr.street}, {addr.number} - {addr.neighborhood}
+                                  </div>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <div className="flex flex-col items-start gap-1">
+                                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium border ${statusColors[derived]}`}>{statusLabel[derived]}</span>
+                                    {timestamp && (
+                                      <span className="text-[10px] text-gray-500 font-medium flex items-center gap-1">
+                                        <Clock className="w-3 h-3" /> {new Date(timestamp).toLocaleString('pt-BR')}
+                                      </span>
+                                    )}
+                                    {derived === 'cancelled' && list.some(i => i.observations) && (
+                                      <span className="text-[11px] text-red-600 leading-tight mt-1">
+                                        {(() => {
+                                          const item = list.find(i => i.status === 'cancelled' && i.observations) || list[0];
+                                          let text = item?.observations || '';
+                                          // Format: (Retorno: Reason) Notes -> Reason - Notes
+                                          if (text.startsWith('(Retorno:')) {
+                                            text = text.replace('(Retorno:', '').replace(')', ' -');
+                                          } else if (text.startsWith('Retorno:')) {
+                                            text = text.replace('Retorno:', '');
+                                          }
+                                          return text.trim();
+                                        })()}
+                                      </span>
+                                    )}
+                                  </div>
+                                </td>
+                                <td className="px-4 py-3 text-right">
+                                  <div className="flex items-center justify-end gap-2">
+                                    <button
+                                      onClick={() => { setOrderProductsModal({ orderId, products: list }); setShowOrderProductsModal(true); }}
+                                      className="inline-flex items-center px-3 py-1.5 rounded-lg border border-blue-200 bg-blue-50 text-blue-700 text-xs font-medium hover:bg-blue-100"
+                                    >
+                                      Ver Produtos
+                                    </button>
+                                    {/* Individual Assembly Romaneio Print */}
+                                    <button
+                                      className="p-1.5 text-purple-600 hover:text-purple-800 hover:bg-purple-50 rounded-lg border border-purple-200 transition-colors"
+                                      title="Imprimir Rota de Montagem Individual"
+                                      onClick={async () => {
+                                        const toastId = toast.loading('Gerando Rota de Montagem Individual...');
+                                        try {
+                                          if (!order || !selectedRoute) throw new Error("Dados não encontrados");
+
+                                          const route = selectedRoute as any;
+                                          const m = montadores.find(u => u.id === route.assembler_id);
+                                          const v = vehicles.find(veh => veh.id === route.vehicle_id);
+
+                                          // Build single order data structure
+                                          const singleRouteOrder = {
+                                            id: String(list[0].id),
+                                            route_id: String(route.id),
+                                            order_id: String(list[0].order_id),
+                                            sequence: 1,
+                                            status: 'pending' as 'pending' | 'delivered' | 'returned',
+                                            created_at: route.created_at,
+                                            updated_at: route.updated_at
+                                          };
+
+                                          const data = {
+                                            route: {
+                                              id: route.id,
+                                              name: route.name,
+                                              driver_id: '',
+                                              vehicle_id: '',
+                                              conferente: '',
+                                              observations: route.observations,
+                                              status: route.status,
+                                              created_at: route.created_at,
+                                              updated_at: route.updated_at,
+                                              route_code: route.route_code
+                                            },
+                                            routeOrders: [singleRouteOrder],
+                                            driver: { id: '', user_id: '', cpf: '', active: true, name: '—', user: { id: '', email: '', name: '—', role: 'driver', created_at: new Date().toISOString() } } as any,
+                                            vehicle: undefined,
+                                            orders: [order] as any,
+                                            generatedAt: new Date().toISOString(),
+                                            assemblyInstallerName: m?.name || m?.email || '—',
+                                            assemblyVehicleModel: v?.model || '',
+                                            assemblyVehiclePlate: v?.plate || ''
+                                          };
+
+                                          const pdfBytes = await DeliverySheetGenerator.generateDeliverySheet(data, 'Rota de Montagem');
+                                          DeliverySheetGenerator.openPDFInNewTab(pdfBytes);
+                                          toast.success('Rota de Montagem Individual gerada!', { id: toastId });
+                                        } catch (e) {
+                                          console.error(e);
+                                          toast.error('Erro ao gerar rota de montagem', { id: toastId });
+                                        }
+                                      }}
+                                    >
+                                      <FileSpreadsheet className="h-4 w-4" />
+                                    </button>
+                                    {((selectedRoute as any)?.status === 'pending' || (selectedRoute as any)?.status === 'in_progress') && (
+                                      <button
+                                        onClick={() => {
+                                          if (confirm(`Deseja remover o pedido ${order.order_id_erp || orderId} da rota?`)) {
+                                            removeOrderFromRoute(orderId);
+                                          }
+                                        }}
+                                        className="inline-flex items-center px-2 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-700 text-xs font-medium hover:bg-red-100"
+                                        title="Remover pedido da rota"
+                                      >
+                                        <Trash2 className="h-4 w-4" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          });
+                        })()}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Delete Empty Route Button - only shows when route has no orders and is pending */}
+                  {(() => {
+                    // Fix: Use same data source as the orders table above for consistency
+                    // This ensures we check assembly_products from the route (if available from search/auto-open)
+                    // before falling back to assemblyInRoutes (which may not be populated for old routes)
+                    const productsInRoute = ((selectedRoute as any).assembly_products && (selectedRoute as any).assembly_products.length > 0)
+                      ? (selectedRoute as any).assembly_products
+                      : assemblyInRoutes.filter(ap => String(ap.assembly_route_id) === String(selectedRoute.id));
+                    const isPending = (selectedRoute as any)?.status === 'pending';
+                    if (productsInRoute.length === 0 && isPending) {
+                      return (
+                        <div className="mt-4 p-4 bg-red-50 border border-red-200 rounded-lg">
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <p className="text-sm font-medium text-red-800">Esta rota está vazia</p>
+                              <p className="text-xs text-red-600">Você pode excluir esta rota pois ela não possui nenhum pedido.</p>
+                            </div>
+                            <button
+                              onClick={() => {
+                                if (confirm('Tem certeza que deseja excluir esta rota vazia?')) {
+                                  deleteEmptyRoute();
+                                }
+                              }}
+                              className="inline-flex items-center px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700"
+                            >
+                              <Trash2 className="h-4 w-4 mr-2" /> Excluir Rota
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                </div>
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* Order Products Modal */}
+      {
+        showOrderProductsModal && orderProductsModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[55] flex items-center justify-center p-4">
+            <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[85vh] flex flex-col overflow-hidden">
+              <div className="px-6 py-4 border-b border-gray-100 flex justify-between items-center bg-gray-50">
+                {(() => { const erp = orderProductsModal.products[0]?.order?.order_id_erp || orderProductsModal.orderId; return (<h3 className="text-lg font-bold text-gray-900">Produtos do Pedido {erp}</h3>); })()}
+                <button onClick={() => { setShowOrderProductsModal(false); setOrderProductsModal(null); }} className="text-gray-400 hover:text-gray-600"><X className="h-5 w-5" /></button>
+              </div>
+              <div className="p-6 overflow-y-auto">
+                <ul className="divide-y divide-gray-200">
+                  {orderProductsModal.products.map((p) => (
+                    <li key={p.id} className="py-3">
+                      <div className="text-sm font-medium text-gray-900">{p.product_name}</div>
+                      <div className="text-xs text-gray-500">SKU: {p.product_sku || '-'}</div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* --- LAUNCH AVULSO MODAL --- */}
+      {
+        showLaunchModal && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+            <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl max-h-[85vh] overflow-hidden flex flex-col relative">
+
+              <div className="p-5 border-b border-gray-100 flex justify-between items-center bg-white z-10">
+                <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+                  <FilePlus className="h-5 w-5 text-orange-600" />
+                  Lançamento Avulso
+                </h2>
+                <button
+                  onClick={() => { setShowLaunchModal(false); setLaunchPreviewData(null); setLaunchObservation(''); }}
+                  className="text-gray-400 hover:text-gray-600 transition-colors p-1"
+                >
+                  <X className="h-6 w-6" />
+                </button>
+              </div>
+
+              <div className="p-6 overflow-y-auto flex-1">
+                {!launchPreviewData ? (
+                  /* STEP 1: SEARCH */
+                  <form onSubmit={handleLaunchSubmit} className="space-y-6">
+                    <div className="text-center mb-6">
+                      <div className="w-16 h-16 bg-orange-50 rounded-full flex items-center justify-center mb-4 mx-auto">
+                        <Search className="h-8 w-8 text-orange-600" />
+                      </div>
+                      <p className="text-gray-500">
+                        Importe uma Troca, Assistência ou Pedido de Venda antigo usando o número do lançamento.
+                      </p>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Número do Lançamento (ERP)</label>
+                      <input
+                        type="text"
+                        value={launchNumber}
+                        onChange={(e) => setLaunchNumber(e.target.value)}
+                        className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none transition-all text-lg font-mono placeholder:font-sans"
+                        placeholder="Ex: 123456"
+                        autoFocus
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Tipo de Serviço</label>
+                      <div className="grid grid-cols-3 gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setLaunchType('troca')}
+                          className={`px-3 py-3 rounded-xl border flex flex-col items-center gap-1.5 transition-all ${launchType === 'troca' ? 'bg-orange-50 border-orange-500 text-orange-700 ring-1 ring-orange-500' : 'bg-white border-gray-200 text-gray-600 hover:border-orange-200 hover:bg-orange-50/50'}`}
+                        >
+                          <RefreshCw className="h-5 w-5" />
+                          <span className="font-semibold text-xs">Troca</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLaunchType('assistencia')}
+                          className={`px-3 py-3 rounded-xl border flex flex-col items-center gap-1.5 transition-all ${launchType === 'assistencia' ? 'bg-blue-50 border-blue-500 text-blue-700 ring-1 ring-blue-500' : 'bg-white border-gray-200 text-gray-600 hover:border-blue-200 hover:bg-blue-50/50'}`}
+                        >
+                          <Wrench className="h-5 w-5" />
+                          <span className="font-semibold text-xs">Assistência</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLaunchType('venda')}
+                          className={`px-3 py-3 rounded-xl border flex flex-col items-center gap-1.5 transition-all ${launchType === 'venda' ? 'bg-emerald-50 border-emerald-500 text-emerald-700 ring-1 ring-emerald-500' : 'bg-white border-gray-200 text-gray-600 hover:border-emerald-200 hover:bg-emerald-50/50'}`}
+                        >
+                          <Package className="h-5 w-5" />
+                          <span className="font-semibold text-xs">Venda</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-2">
+                      <button
+                        type="submit"
+                        disabled={launchLoading || !launchNumber}
+                        className="w-full px-6 py-3 bg-gray-900 text-white rounded-xl font-bold hover:bg-black transition-all flex items-center justify-center shadow-lg disabled:opacity-70 disabled:cursor-not-allowed"
+                      >
+                        {launchLoading ? (
+                          <>
+                            <Loader2 className="animate-spin h-5 w-5 mr-2" />
+                            Buscando...
+                          </>
+                        ) : (
+                          <>
+                            <Search className="h-5 w-5 mr-2" />
+                            Buscar Pedido
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  /* STEP 2: SELECT PRODUCTS */
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="font-medium text-gray-700">Selecione os produtos para importar:</span>
+                      <span className="bg-orange-100 text-orange-800 py-0.5 px-2 rounded-full text-xs font-medium">
+                        {selectedPreviewIndices.size} selecionado(s)
+                      </span>
+                    </div>
+
+                    <div className="border border-gray-200 rounded-xl divide-y divide-gray-100 max-h-[400px] overflow-y-auto">
+                      {launchPreviewData.map((item, i) => (
+                        <React.Fragment key={i}>
+                          {item.produtos.map((prod: any) => {
+                            const key = prod._selectionKey;
+                            const isSelected = selectedPreviewIndices.has(key);
+                            return (
+                              <div
+                                key={key}
+                                className={`p-4 flex items-start gap-4 cursor-pointer transition-colors ${isSelected ? 'bg-orange-50/60 hover:bg-orange-50' : 'hover:bg-gray-50'}`}
+                                onClick={() => {
+                                  const next = new Set(selectedPreviewIndices);
+                                  if (next.has(key)) next.delete(key);
+                                  else next.add(key);
+                                  setSelectedPreviewIndices(next);
+                                }}
+                              >
+                                <div className={`mt-1 w-5 h-5 rounded border flex items-center justify-center flex-shrink-0 transition-colors ${isSelected ? 'bg-orange-500 border-orange-500' : 'border-gray-300 bg-white'}`}>
+                                  {isSelected && <CheckCircle2 className="w-3.5 h-3.5 text-white" />}
+                                </div>
+                                <div className="flex-1">
+                                  <div className={`font-medium text-sm ${isSelected ? 'text-orange-900' : 'text-gray-900'}`}>
+                                    {prod.nome_produto || 'Produto sem nome'}
+                                  </div>
+                                  <div className="text-gray-500 text-xs mt-0.5">SKU: {prod.codigo_produto}</div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </React.Fragment>
+                      ))}
+                    </div>
+
+                    {/* Campo de Observação Interna */}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-2">Observação Interna (opcional)</label>
+                      <textarea
+                        value={launchObservation}
+                        onChange={(e) => setLaunchObservation(e.target.value)}
+                        className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:ring-2 focus:ring-orange-500 outline-none transition-all text-sm resize-none"
+                        placeholder="Digite uma observação interna para este pedido..."
+                        rows={3}
+                      />
+                    </div>
+
+                    <div className="bg-blue-50 p-4 rounded-xl text-sm text-blue-700 flex items-start gap-3">
+                      <AlertCircle className="w-5 h-5 mt-0.5 flex-shrink-0 text-blue-600" />
+                      <p className="leading-relaxed text-xs">
+                        <strong>Atenção:</strong> Apenas os produtos selecionados serão importados e salvos no histórico do pedido.
+                      </p>
+                    </div>
+
+                    <div className="pt-4 flex gap-3">
+                      <button
+                        type="button"
+                        onClick={() => setLaunchPreviewData(null)}
+                        className="flex-1 px-4 py-3 border border-gray-300 text-gray-700 font-medium rounded-xl hover:bg-gray-50 transition-colors"
+                      >
+                        Voltar
+                      </button>
+                      <button
+                        onClick={confirmLaunchImport}
+                        disabled={launchLoading || selectedPreviewIndices.size === 0}
+                        className="flex-[2] flex items-center justify-center px-4 py-3 bg-green-600 text-white font-bold rounded-xl hover:bg-green-700 disabled:opacity-50 shadow-lg transition-all"
+                      >
+                        {launchLoading ? (
+                          <>
+                            <Loader2 className="animate-spin h-5 w-5 mr-2" />
+                            Importando...
+                          </>
+                        ) : (
+                          <>
+                            <CheckCircle2 className="h-5 w-5 mr-2" />
+                            Confirmar Importação
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* Modal de Ordenação do PDF */}
+      {
+        showPdfSortModal && selectedRoute && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+              <div className="bg-gradient-to-r from-blue-600 to-blue-700 px-6 py-4">
+                <h3 className="text-lg font-bold text-white">Gerar Rota de Montagem</h3>
+                <p className="text-blue-100 text-sm">Escolha a ordenação dos pedidos</p>
+              </div>
+              <div className="p-6 space-y-4">
+                <div className="space-y-3">
+                  <label className="flex items-center p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors">
+                    <input
+                      type="radio"
+                      name="pdfSort"
+                      value="data_venda"
+                      checked={pdfSortOption === 'data_venda'}
+                      onChange={() => setPdfSortOption('data_venda')}
+                      className="w-4 h-4 text-blue-600 border-gray-300 focus:ring-blue-500"
+                    />
+                    <div className="ml-3">
+                      <span className="font-medium text-gray-900">Por Data de Venda</span>
+                      <p className="text-sm text-gray-500">Da mais antiga para a mais recente</p>
+                    </div>
+                  </label>
+                  <label className="flex items-center p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors">
+                    <input
+                      type="radio"
+                      name="pdfSort"
+                      value="cidade"
+                      checked={pdfSortOption === 'cidade'}
+                      onChange={() => setPdfSortOption('cidade')}
+                      className="w-4 h-4 text-blue-600 border-gray-300 focus:ring-blue-500"
+                    />
+                    <div className="ml-3">
+                      <span className="font-medium text-gray-900">Por Cidade</span>
+                      <p className="text-sm text-gray-500">Ordem alfabética (A-Z)</p>
+                    </div>
+                  </label>
+                  <label className="flex items-center p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors">
+                    <input
+                      type="radio"
+                      name="pdfSort"
+                      value="previsao_montagem"
+                      checked={pdfSortOption === 'previsao_montagem'}
+                      onChange={() => setPdfSortOption('previsao_montagem')}
+                      className="w-4 h-4 text-blue-600 border-gray-300 focus:ring-blue-500"
+                    />
+                    <div className="ml-3">
+                      <span className="font-medium text-gray-900">Por Previsão de Montagem</span>
+                      <p className="text-sm text-gray-500">Da mais antiga para a mais recente</p>
+                    </div>
+                  </label>
+                  <label className="flex items-center p-3 border rounded-lg cursor-pointer hover:bg-gray-50 transition-colors">
+                    <input
+                      type="radio"
+                      name="pdfSort"
+                      value="cliente"
+                      checked={pdfSortOption === 'cliente'}
+                      onChange={() => setPdfSortOption('cliente')}
+                      className="w-4 h-4 text-blue-600 border-gray-300 focus:ring-blue-500"
+                    />
+                    <div className="ml-3">
+                      <span className="font-medium text-gray-900">Por Cliente</span>
+                      <p className="text-sm text-gray-500">Ordem alfabética (A-Z)</p>
+                    </div>
+                  </label>
+                </div>
+              </div>
+              <div className="px-6 py-4 bg-gray-50 flex justify-end gap-3">
+                <button
+                  onClick={() => setShowPdfSortModal(false)}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={async () => {
+                    try {
+                      if (!selectedRoute) return;
+                      const route = selectedRoute as any;
+                      const products = assemblyInRoutes.filter(ap => ap.assembly_route_id === route.id);
+                      let orders = products.map(p => p.order).filter(Boolean) as any[];
+
+                      // Ordenar pedidos conforme opção selecionada
+                      const parseDate = (d: any) => {
+                        if (!d) return new Date(0);
+                        try { return new Date(d); } catch { return new Date(0); }
+                      };
+
+                      if (pdfSortOption === 'data_venda') {
+                        orders.sort((a, b) => {
+                          const dateA = parseDate(a.data_venda || a.raw_json?.data_venda);
+                          const dateB = parseDate(b.data_venda || b.raw_json?.data_venda);
+                          return dateA.getTime() - dateB.getTime();
+                        });
+                      } else if (pdfSortOption === 'cidade') {
+                        orders.sort((a, b) => {
+                          const cityA = (a.address_json?.city || a.raw_json?.cidade || '').toLowerCase();
+                          const cityB = (b.address_json?.city || b.raw_json?.cidade || '').toLowerCase();
+                          return cityA.localeCompare(cityB);
+                        });
+                      } else if (pdfSortOption === 'previsao_montagem') {
+                        orders.sort((a, b) => {
+                          const dateA = parseDate(getPrevisaoMontagemValue(a));
+                          const dateB = parseDate(getPrevisaoMontagemValue(b));
+                          return dateA.getTime() - dateB.getTime();
+                        });
+                      } else if (pdfSortOption === 'cliente') {
+                        orders.sort((a, b) => {
+                          const clientA = (a.customer_name || a.raw_json?.nome_cliente || '').toLowerCase();
+                          const clientB = (b.customer_name || b.raw_json?.nome_cliente || '').toLowerCase();
+                          return clientA.localeCompare(clientB);
+                        });
+                      }
+
+                      // Criar routeOrders na ordem dos orders ordenados
+                      const routeOrders = orders.map((order, idx) => {
+                        const product = products.find(p => p.order_id === order.id);
+                        return {
+                          id: String(product?.id || ''),
+                          route_id: String(route.id),
+                          order_id: String(order.id),
+                          sequence: idx + 1,
+                          status: 'pending',
+                          created_at: route.created_at,
+                          updated_at: route.updated_at
+                        };
+                      }) as any[];
+
+                      const routeData: any = {
+                        id: route.id,
+                        name: route.name,
+                        driver_id: '',
+                        vehicle_id: '',
+                        conferente: '',
+                        observations: route.observations,
+                        status: route.status as any,
+                        created_at: route.created_at,
+                        updated_at: route.updated_at,
+                        route_code: (route as any).route_code
+                      };
+                      const m = montadores.find(m => m.id === (route as any).assembler_id);
+                      const v = vehicles.find(v => v.id === (route as any).vehicle_id);
+                      const data = {
+                        route: routeData,
+                        routeOrders,
+                        driver: { id: '', user_id: '', cpf: '', active: true, name: '—', user: { id: '', email: '', name: '—', role: 'driver', created_at: new Date().toISOString() } } as any,
+                        vehicle: undefined,
+                        orders: orders as any,
+                        generatedAt: new Date().toISOString(),
+                        assemblyInstallerName: m?.name || m?.email || '—',
+                        assemblyVehicleModel: v?.model || '',
+                        assemblyVehiclePlate: v?.plate || ''
+                      };
+                      const pdfBytes = await DeliverySheetGenerator.generateDeliverySheet(data, 'Rota de Montagem');
+                      DeliverySheetGenerator.openPDFInNewTab(pdfBytes);
+                      setShowPdfSortModal(false);
+                    } catch (e) {
+                      console.error(e);
+                      toast.error('Erro ao gerar PDF da rota de montagem');
+                    }
+                  }}
+                  className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700"
+                >
+                  Gerar PDF
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      }
+    </div >
+  );
+}
+
+export default function AssemblyManagement() {
+  return (
+    <AssemblyManagementErrorBoundary>
+      <AssemblyManagementContent />
+    </AssemblyManagementErrorBoundary>
+  );
+}

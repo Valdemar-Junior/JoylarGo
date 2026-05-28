@@ -1,0 +1,950 @@
+import { useEffect, useRef, useState } from 'react';
+import {
+  Package,
+  RefreshCw,
+  Eye,
+  Hammer,
+  Truck,
+  ArrowLeft,
+  LayoutGrid,
+  TruckIcon,
+  UploadCloud,
+  CheckCircle2,
+  AlertTriangle,
+  Clock,
+  ChevronDown,
+  ChevronUp,
+  ChevronLeft,
+  ChevronRight,
+  Search
+} from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
+import { supabase } from '../../supabase/client';
+
+export default function OrdersImport() {
+  const [loading, setLoading] = useState(false);
+  const [lastImport, setLastImport] = useState<Date | null>(null);
+  const [webhookStatus, setWebhookStatus] = useState<string | null>(null);
+  const [expandedManifests, setExpandedManifests] = useState<Record<string, boolean>>({});
+  const [manifestSummaries, setManifestSummaries] = useState<any[]>([]);
+  const [manifestDetails, setManifestDetails] = useState<Record<string, any[]>>({});
+  const [manifestLoading, setManifestLoading] = useState<Record<string, boolean>>({});
+  const [manifestTotalCount, setManifestTotalCount] = useState(0);
+  const [manifestPage, setManifestPage] = useState(0);
+  const [searchManifest, setSearchManifest] = useState('');
+  const MANIFESTS_PER_PAGE = 10;
+  const navigate = useNavigate();
+
+  // Stats
+  const [stats, setStats] = useState({ total: 0, pending: 0, today: 0 });
+
+  // Update Config
+  const [allowUpdatesConfig, setAllowUpdatesConfig] = useState(false);
+  const [updateExisting, setUpdateExisting] = useState(false);
+
+  const invokeAdminWebhook = async (key: string, body: any) => {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData?.session?.access_token || '';
+    if (!accessToken) throw new Error('Sessao expirada. Faca login novamente.');
+
+    const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/invoke-admin-webhook`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({ key, body, auth_token: accessToken }),
+    });
+
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(payload?.error || `Falha ao chamar webhook ${key}`);
+    }
+
+    return payload;
+  };
+
+  useEffect(() => {
+    supabase.from('app_settings').select('value').eq('key', 'allow_order_updates_on_import').single()
+      .then(({ data, error }) => {
+        console.log('[OrdersImport] Config Fetch:', { data, error });
+        if (error) {
+          console.error('Error fetching config:', error);
+        }
+        const enabled = (data?.value as any)?.enabled;
+        console.log('[OrdersImport] Enabled value:', enabled);
+        setAllowUpdatesConfig(enabled === true);
+      })
+      .catch(err => console.error('[OrdersImport] Promise error:', err));
+  }, []);
+  const buildManifestSummariesFromOrders = (orders: any[]) => {
+    const grouped = new Map<string, any>();
+
+    orders.forEach((order: any) => {
+      const manifestKey = order.manifest_id || 'avulsos';
+      const current = grouped.get(manifestKey);
+
+      if (!current) {
+        grouped.set(manifestKey, {
+          manifest_key: manifestKey,
+          manifest_id: order.manifest_id || null,
+          imported_at: order.created_at,
+          total_orders: 1,
+          is_avulso: !order.manifest_id,
+          orders: [order],
+        });
+        return;
+      }
+
+      current.total_orders += 1;
+      current.orders.push(order);
+      if (new Date(order.created_at).getTime() > new Date(current.imported_at).getTime()) {
+        current.imported_at = order.created_at;
+      }
+    });
+
+    return Array.from(grouped.values()).sort((a, b) => {
+      if (a.is_avulso) return 1;
+      if (b.is_avulso) return -1;
+      const aNum = /^\d+$/.test(String(a.manifest_id || '')) ? Number(a.manifest_id) : Number.NEGATIVE_INFINITY;
+      const bNum = /^\d+$/.test(String(b.manifest_id || '')) ? Number(b.manifest_id) : Number.NEGATIVE_INFINITY;
+      if (aNum !== bNum) return bNum - aNum;
+      return new Date(b.imported_at).getTime() - new Date(a.imported_at).getTime();
+    });
+  };
+
+  const fetchImportStats = async () => {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+    const startOfTomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+
+    const [
+      { count: totalCount, error: totalError },
+      { count: pendingCount, error: pendingError },
+      { count: todayCount, error: todayError }
+    ] = await Promise.all([
+      supabase.from('orders').select('*', { count: 'exact', head: true }),
+      supabase.from('orders').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
+      supabase.from('orders').select('*', { count: 'exact', head: true }).gte('created_at', startOfToday).lt('created_at', startOfTomorrow),
+    ]);
+
+    if (totalError || pendingError || todayError) {
+      console.error('Erro ao carregar estatisticas de importacao:', { totalError, pendingError, todayError });
+      return;
+    }
+
+    setStats({
+      total: totalCount || 0,
+      pending: pendingCount || 0,
+      today: todayCount || 0,
+    });
+  };
+
+  const fetchManifestSummaries = async (page = manifestPage, search = searchManifest) => {
+    const trimmedSearch = search.trim();
+    const offset = page * MANIFESTS_PER_PAGE;
+
+    const { data, error } = await supabase.rpc('get_import_history_summary', {
+      p_search: trimmedSearch || null,
+      p_limit: MANIFESTS_PER_PAGE,
+      p_offset: offset,
+    });
+
+    if (!error) {
+      const summaries = data || [];
+      setManifestSummaries(summaries);
+      setManifestTotalCount(Number(summaries[0]?.total_groups || 0));
+      return;
+    }
+
+    console.warn('[OrdersImport] Falha ao carregar resumo por romaneio. Usando fallback legado.', error);
+
+    const { data: legacyData, error: legacyError } = await supabase
+      .from('orders')
+      .select('id, created_at, status, customer_name, order_id_erp, manifest_id, address_json')
+      .order('created_at', { ascending: false })
+      .limit(500);
+
+    if (legacyError) {
+      console.error('Erro ao carregar pedidos do banco:', legacyError);
+      return;
+    }
+
+    const summaries = buildManifestSummariesFromOrders(legacyData || []);
+    const filteredSummaries = trimmedSearch
+      ? summaries.filter((summary: any) => String(summary.manifest_key || '').toLowerCase().includes(trimmedSearch.toLowerCase()))
+      : summaries;
+
+    setManifestTotalCount(filteredSummaries.length);
+    setManifestSummaries(filteredSummaries.slice(offset, offset + MANIFESTS_PER_PAGE));
+
+    const preloadedDetails = filteredSummaries.reduce((acc: Record<string, any[]>, summary: any) => {
+      acc[summary.manifest_key] = summary.orders || [];
+      return acc;
+    }, {});
+    setManifestDetails(prev => ({ ...preloadedDetails, ...prev }));
+  };
+
+  const fetchManifestOrders = async (manifestKey: string, isAvulso: boolean) => {
+    setManifestLoading(prev => ({ ...prev, [manifestKey]: true }));
+
+    let query = supabase
+      .from('orders')
+      .select('id, created_at, status, customer_name, order_id_erp, manifest_id, address_json')
+      .order('created_at', { ascending: false });
+
+    query = isAvulso ? query.is('manifest_id', null) : query.eq('manifest_id', manifestKey);
+
+    const { data, error } = await query;
+
+    setManifestLoading(prev => ({ ...prev, [manifestKey]: false }));
+
+    if (error) {
+      console.error(`Erro ao carregar pedidos do romaneio ${manifestKey}:`, error);
+      toast.error(`Erro ao carregar pedidos do romaneio ${manifestKey}.`);
+      return;
+    }
+
+    setManifestDetails(prev => ({ ...prev, [manifestKey]: data || [] }));
+  };
+
+  const toggleManifest = async (summary: any) => {
+    const manifestKey = summary.manifest_key;
+    const willExpand = !expandedManifests[manifestKey];
+
+    setExpandedManifests(prev => ({ ...prev, [manifestKey]: willExpand }));
+
+    if (willExpand && !manifestDetails[manifestKey] && !manifestLoading[manifestKey]) {
+      await fetchManifestOrders(manifestKey, Boolean(summary.is_avulso));
+    }
+  };
+
+  useEffect(() => {
+    void fetchImportStats();
+    void fetchManifestSummaries(manifestPage, searchManifest);
+  }, [manifestPage, searchManifest]);
+
+  useEffect(() => {
+    const handler = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchImportStats();
+        void fetchManifestSummaries(manifestPage, searchManifest);
+      }
+    };
+
+    document.addEventListener('visibilitychange', handler);
+    return () => document.removeEventListener('visibilitychange', handler);
+  }, [manifestPage, searchManifest]);
+
+
+
+  const normalizePdfBase64 = (value: unknown): string => {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    const withoutPrefix = trimmed.startsWith('data:application/pdf;base64,')
+      ? trimmed.slice('data:application/pdf;base64,'.length)
+      : trimmed;
+    const compact = withoutPrefix.replace(/\s+/g, '');
+    return compact.startsWith('JVBER') ? compact : '';
+  };
+
+  const parseDanfeWebhookPayload = (payload: any) => {
+    const base64List: string[] = [];
+    const byOrderId = new Map<string, string>();
+    const byNumero = new Map<string, string>();
+
+    const push = (raw: unknown, orderId?: unknown, numero?: unknown) => {
+      const b64 = normalizePdfBase64(raw);
+      if (!b64) return;
+      base64List.push(b64);
+      if (orderId !== undefined && orderId !== null && String(orderId).trim()) {
+        byOrderId.set(String(orderId), b64);
+      }
+      if (numero !== undefined && numero !== null && String(numero).trim()) {
+        byNumero.set(String(numero), b64);
+      }
+    };
+
+    const readEntry = (entry: any) => {
+      if (!entry) return;
+      if (typeof entry === 'string') {
+        push(entry);
+        return;
+      }
+      if (typeof entry !== 'object') return;
+
+      const orderId = entry.order_id ?? entry.orderId ?? entry.id;
+      const numero = entry.numero ?? entry.order_id_erp ?? entry.pedido ?? entry.lancamento;
+
+      push(entry.pdf_base64, orderId, numero);
+      push(entry.base64, orderId, numero);
+      push(entry.pdf, orderId, numero);
+      push(entry.danfe_base64, orderId, numero);
+      push(entry.data, orderId, numero);
+    };
+
+    readEntry(payload);
+    if (Array.isArray(payload)) payload.forEach(readEntry);
+    if (payload && typeof payload === 'object') {
+      const nestedArrays = [payload.documentos, payload.arquivos, payload.items, payload.results, payload.resultados, payload.data];
+      nestedArrays.forEach((arr: any) => {
+        if (Array.isArray(arr)) arr.forEach(readEntry);
+      });
+    }
+
+    return { base64List: Array.from(new Set(base64List)), byOrderId, byNumero };
+  };
+
+  const generateDanfeInBackground = async (insertedOrders: any[], importedOrders: any[]) => {
+    if (!insertedOrders.length || !importedOrders.length) return;
+
+    try {
+      const xmlByNumero = new Map<string, string>(
+        importedOrders
+          .map((o: any) => [String(o.order_id_erp || '').trim(), String(o.xml_documento || '').trim()] as const)
+          .filter(([numero, xml]) => Boolean(numero && xml && xml.includes('<')))
+      );
+
+      const docs = insertedOrders
+        .map((saved: any) => ({
+          order_id: String(saved?.id || ''),
+          numero: String(saved?.order_id_erp || ''),
+          xml: xmlByNumero.get(String(saved?.order_id_erp || '').trim()) || ''
+        }))
+        .filter((d: any) => d.order_id && d.numero && d.xml && d.xml.includes('<'));
+
+      if (docs.length === 0) {
+        console.log('[Import] Nenhum XML valido encontrado para geracao de DANFE em background.');
+        return;
+      }
+
+      console.log(`[Import] Enviando ${docs.length} pedidos para geracao de DANFE em background`);
+
+      let payload: any = null;
+      try {
+        const result = await invokeAdminWebhook('gera_nf', { documentos: docs, count: docs.length });
+        payload = result?.data ?? null;
+      } catch (error) {
+        console.warn('[Import] Webhook gera_nf retornou erro:', error);
+        return;
+      }
+
+      const { base64List, byOrderId, byNumero } = parseDanfeWebhookPayload(payload);
+      if (base64List.length === 0) {
+        console.warn('[Import] Webhook gera_nf nao retornou DANFE em base64.');
+        return;
+      }
+
+      const updates = new Map<string, string>();
+      docs.forEach((doc: any, idx: number) => {
+        if (byOrderId.has(doc.order_id)) {
+          updates.set(doc.order_id, byOrderId.get(doc.order_id)!);
+          return;
+        }
+        if (byNumero.has(doc.numero)) {
+          updates.set(doc.order_id, byNumero.get(doc.numero)!);
+          return;
+        }
+        if (base64List.length === docs.length && base64List[idx]) {
+          updates.set(doc.order_id, base64List[idx]);
+        }
+      });
+
+      if (updates.size === 0 && docs.length === 1 && base64List[0]) {
+        updates.set(docs[0].order_id, base64List[0]);
+      }
+
+      let savedCount = 0;
+      for (const [orderId, b64] of updates.entries()) {
+        const { error } = await supabase
+          .from('orders')
+          .update({ danfe_base64: b64, danfe_gerada_em: new Date().toISOString() })
+          .eq('id', orderId);
+        if (error) {
+          console.warn(`[Import] Falha ao salvar DANFE do pedido ${orderId}:`, error);
+        } else {
+          savedCount++;
+        }
+      }
+
+      if (savedCount > 0) {
+        console.log(`[Import] DANFE em background concluida: ${savedCount} pedido(s) atualizado(s).`);
+      } else {
+        console.warn('[Import] Nenhuma DANFE foi salva apos retorno do webhook.');
+      }
+    } catch (e) {
+      console.warn('[Import] Erro ao gerar/salvar DANFE em background:', e);
+    }
+  };
+
+  const importOrders = async () => {
+    setLoading(true);
+
+    try {
+      const result = await invokeAdminWebhook('envia_pedidos', { timestamp: new Date().toISOString() });
+      setWebhookStatus(String(result?.status || '200'));
+      const data: any = result?.data;
+
+      if (!result?.ok) {
+        if (typeof data === 'object' && data?.message?.includes('webhook')) {
+          toast.error('Webhook de teste não está ativo. Clique em "Execute workflow" no n8n e tente novamente.');
+        } else {
+          toast.error('Erro ao consultar webhook.');
+        }
+        return;
+      }
+
+      const items = (Array.isArray(data) ? data : [data]).filter((item: any) => item && typeof item === 'object');
+      // setOrders(items); // Not used anymore
+
+      // Transformar e salvar no banco - SALVAR TODOS OS CAMPOS DO JSON
+      const toDb = items.map((o: any) => {
+        const produtosRaw = Array.isArray(o?.produtos) ? o.produtos : (Array.isArray(o?.produtos_locais) ? o.produtos_locais : []);
+        const produtos = produtosRaw.filter((p: any) => p && typeof p === 'object');
+        const xmlDanfe = o.xml_danfe_remessa || {};
+        const explicitOrderTotal = Number(
+          o?.valor_total_pedido ??
+          o?.valor_total ??
+          o?.total ??
+          o?.total_pedido ??
+          0
+        );
+
+        let quantidade_volumes = 0;
+        let etiquetas: string[] = [];
+        let calculatedItemsTotal = 0;
+
+        if (produtos.length > 0) {
+          produtos.forEach((p: any) => {
+            if (p.quantidade_volumes) quantidade_volumes += p.quantidade_volumes;
+            if (p.etiquetas && Array.isArray(p.etiquetas)) {
+              etiquetas = etiquetas.concat(p.etiquetas);
+            }
+            const itemTotal = Number(
+              p?.valor_total_real ??
+              p?.valor_total_item ??
+              p?.valor_total ??
+              (Number(p?.valor_unitario_real ?? p?.valor_unitario ?? 0) * Number(p?.quantidade_comprada ?? p?.quantidade_volumes ?? 1))
+            );
+            if (Number.isFinite(itemTotal)) calculatedItemsTotal += itemTotal;
+          });
+        }
+        const orderTotal = Number.isFinite(explicitOrderTotal) && explicitOrderTotal > 0
+          ? explicitOrderTotal
+          : calculatedItemsTotal;
+
+        // Extract representative department/brand for the order (from first valid item)
+        const repDept = produtos.find((p: any) => p.departamento)?.departamento || produtos.find((p: any) => p.department)?.department || '';
+        const repBrand = produtos.find((p: any) => p.marca)?.marca || produtos.find((p: any) => p.brand)?.brand || '';
+
+        // NOVO: Detectar keyword *montagem* nas observações internas (Robust Check)
+        // Check root field OR raw_json field if available
+        const rawObs = o.observacoes_internas || o.observacoes || (o.raw_json && o.raw_json.observacoes_internas) || '';
+        const obsInternas = String(rawObs).toLowerCase();
+
+        // Check for "*montagem*" strictly as requested
+        const hasKeywordMontagem = obsInternas.includes('*montagem*');
+
+        console.log(`[Import Debug] Pedido ${o.numero_lancamento}: Obs="${obsInternas}", Montagem=${hasKeywordMontagem}`);
+
+        return {
+          department: String(repDept),
+          brand: String(repBrand),
+          product_group: String(produtos.find((p: any) => p.grupo_produto)?.grupo_produto || ''),
+          product_subgroup: String(produtos.find((p: any) => p.subgrupo_produto)?.subgrupo_produto || ''),
+          order_id_erp: String(o.numero_lancamento ?? o.lancamento_venda ?? o.codigo_cliente ?? Math.random().toString(36).slice(2)),
+          manifest_id: o.numero_romaneio ? String(o.numero_romaneio) : null,
+          customer_name: String(o.nome_cliente ?? ''),
+          phone: String(o.cliente_celular ?? ''),
+          customer_cpf: String(o.cpf_cliente ?? ''),
+          filial_venda: String(o.filial_venda ?? ''),
+          vendedor_nome: String(o.nome_vendedor ?? o.vendedor ?? o.vendedor_nome ?? ''),
+          data_venda: o.data_venda ? new Date(o.data_venda).toISOString() : null,
+          // previsao_entrega: o.previsao_entrega ? new Date(o.previsao_entrega).toISOString() : null, // Ignored: Handled by DB trigger 'calculate_order_deadlines'
+          observacoes_publicas: String(o.observacoes_publicas ?? ''),
+          observacoes_internas: String(o.observacoes_internas ?? ''),
+          observations: String(o.observacoes ?? o.observacoes_publicas ?? ''),
+          tem_frete_full: String(o.tem_frete_full ?? ''),
+          total: Number.isFinite(orderTotal) ? orderTotal : 0,
+          address_json: {
+            street: String(o.destinatario_endereco ?? ''),
+            neighborhood: String(o.destinatario_bairro ?? ''),
+            city: String(o.destinatario_cidade ?? ''),
+            state: '',
+            zip: pickZip(o),
+            complement: String(o.destinatario_complemento ?? ''),
+            lat: o.lat ?? o.latitude ?? null,
+            lng: o.lng ?? o.longitude ?? o.long ?? null
+          },
+          items_json: produtos.map((p: any) => {
+            const explicitFlag = String(p.tem_montagem ?? '');
+            const calculatedHasAssembly = hasKeywordMontagem ? 'Sim' : explicitFlag;
+
+            // Log decision for first item usually
+            if (p.codigo_produto && hasKeywordMontagem) {
+              console.log(`[Import Item Debug] SKU=${p.codigo_produto} FlagOriginal="${explicitFlag}" KeywordFound=${hasKeywordMontagem} -> Final="${calculatedHasAssembly}"`);
+            }
+
+            return {
+              sku: String(p.codigo_produto ?? ''),
+              name: String(p.nome_produto ?? ''),
+              quantity: Number(p.quantidade_volumes ?? 1),
+              volumes_per_unit: Number(p.quantidade_volumes ?? 1),
+              purchased_quantity: Number(p.quantidade_comprada ?? 1),
+              unit_price_real: Number(p.valor_unitario_real ?? p.valor_unitario ?? 0),
+              total_price_real: Number(p.valor_total_real ?? p.valor_total_item ?? 0),
+              unit_price: Number(p.valor_unitario_real ?? p.valor_unitario ?? 0),
+              total_price: Number(p.valor_total_real ?? p.valor_total_item ?? 0),
+              price: Number(p.valor_unitario_real ?? p.valor_unitario ?? 0),
+              location: String(p.local_estocagem ?? ''),
+              // MODIFICADO: Se tem keyword *montagem* OU se ERP já marcou, define como 'Sim'
+              has_assembly: calculatedHasAssembly,
+              labels: Array.isArray(p.etiquetas) ? p.etiquetas : [],
+              department: String(p.departamento ?? ''),
+              brand: String(p.marca ?? ''),
+              produto_e_montavel: String(p.produto_e_montavel ?? ''), // Persistindo dado do ERP
+
+              // Novos campos para Suporte a Kits e Detalhes
+              faz_parte_de_kit: String(p.faz_parte_de_kit ?? 'NÃO'),
+              codigo_kit_pai: p.codigo_kit_pai ? String(p.codigo_kit_pai) : null,
+              nome_kit_pai: p.nome_kit_pai ? String(p.nome_kit_pai) : null,
+              qtde_receita: p.qtde_receita ? Number(p.qtde_receita) : null,
+
+              // Campos detalhados de produto
+              descricao: String(p.descricao ?? p.nome_produto ?? ''),
+              cor: String(p.cor ?? ''),
+              referencia: String(p.referencia ?? '')
+            }
+          }),
+          status: 'pending' as const,
+          raw_json: o,
+          xml_documento: xmlDanfe.conteudo_xml || null,
+          import_source: 'lote',
+        } as any;
+      });
+
+      // Verificar quais pedidos já existem para evitar duplicidade
+      const numerosLancamento = toDb.map((o: any) => o.order_id_erp).filter(Boolean);
+      const seen = new Set<string>();
+      const toDbUnique = toDb.filter((o: any) => {
+        const k = String(o.order_id_erp || '').trim();
+        if (!k) return false;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      let existentes: any[] = [];
+
+      if (numerosLancamento.length > 0) {
+        const { data: existentesPorLancamento } = await supabase
+          .from('orders')
+          .select('id, order_id_erp')
+          .in('order_id_erp', numerosLancamento);
+        existentes = existentesPorLancamento || [];
+      }
+
+      const existentesLancamentoSet = new Set<string>((existentes || []).map((e: any) => String(e.order_id_erp)).filter(Boolean));
+
+      const paraInserir = toDbUnique.filter((o: any) => {
+        if (o.order_id_erp && existentesLancamentoSet.has(String(o.order_id_erp))) {
+          return false;
+        }
+        return true;
+      });
+
+      // Filter orders to update: Must exist AND updateExisting must be checked
+      const paraAtualizar = toDbUnique.filter((o: any) => {
+        return o.order_id_erp && existentesLancamentoSet.has(String(o.order_id_erp)) && updateExisting;
+      });
+
+      const duplicados = toDb.length - toDbUnique.length + (toDbUnique.length - paraInserir.length - paraAtualizar.length);
+
+      // Inserir apenas pedidos completamente novos
+      let inseridos = 0;
+      let atualizados = 0;
+      let errosInsercao = 0;
+      let firstInsertErrorMessage = '';
+
+      const savedOrderIds: string[] = [];
+      const savedOrdersInfo: any[] = [];
+
+      // FASE 1: SALVAR PEDIDOS (Rápido)
+      for (const pedido of paraInserir) {
+        try {
+          const { data: inserted, error: insertError } = await supabase
+            .from('orders')
+            .insert(pedido)
+            .select('id, order_id_erp, address_json')
+            .single();
+
+          if (!insertError) {
+            inseridos++;
+            if (inserted?.id) {
+              savedOrderIds.push(inserted.id);
+              savedOrdersInfo.push(inserted);
+            }
+          } else {
+            errosInsercao++;
+            if (!firstInsertErrorMessage) firstInsertErrorMessage = insertError.message || JSON.stringify(insertError);
+            console.warn('Erro ao inserir pedido:', pedido.order_id_erp, insertError);
+          }
+        } catch (e: any) {
+          errosInsercao++;
+          if (!firstInsertErrorMessage) firstInsertErrorMessage = e?.message || String(e);
+          console.error('Erro crítico ao inserir pedido:', pedido.order_id_erp, e);
+        }
+      }
+
+      // FASE 2: ATUALIZAR PEDIDOS EXISTENTES (Se habilitado)
+      if (paraAtualizar.length > 0) {
+        console.log(`[Import] Iniciando atualização de ${paraAtualizar.length} pedidos existentes...`);
+
+        // Usamos Promise.all para paralelizar, mas com throttling se fosse muitos (aqui assumimos < 500)
+        const updatePromises = paraAtualizar.map(async (o: any) => {
+          try {
+            const original = existentes.find(e => String(e.order_id_erp) === String(o.order_id_erp));
+            if (!original) return;
+
+            // SAFE UPDATE: Apenas campos informativos de produto e classificação
+            const { error: updateError } = await supabase.from('orders').update({
+              items_json: o.items_json,        // Descrição, Cor, Ref
+              raw_json: o.raw_json,            // JSON Bruto
+              product_group: o.product_group,  // Novo Grupo
+              product_subgroup: o.product_subgroup, // Novo Subgrupo
+              observacoes_internas: o.observacoes_internas // Obs
+              // NÃO TOCA EM: status, tem_frete_full, address_json, dates
+            }).eq('id', original.id);
+
+            if (!updateError) atualizados++;
+            else console.warn(`Erro ao atualizar pedido ${o.order_id_erp}:`, updateError);
+          } catch (e) {
+            console.error(`Erro crítico ao atualizar pedido ${o.order_id_erp}:`, e);
+          }
+        });
+
+        await Promise.all(updatePromises);
+      }
+
+      const pedidosImportados = inseridos;
+      if (pedidosImportados === 0 && paraInserir.length > 0 && errosInsercao > 0) {
+        toast.error(`Nenhum pedido foi salvo. Primeiro erro: ${firstInsertErrorMessage || 'falha de insercao'}`, {
+          duration: 7000,
+        });
+      }
+
+      toast.success(`Importação: ${pedidosImportados} novos. ${atualizados > 0 ? `${atualizados} atualizados. ` : ''}(${duplicados} ignorados)`, {
+        duration: 5000,
+        style: { background: '#10B981', color: 'white' }
+      });
+
+      await Promise.all([
+        fetchImportStats(),
+        fetchManifestSummaries(0, searchManifest),
+      ]);
+      setExpandedManifests({});
+      setManifestDetails({});
+      setManifestPage(0);
+      setLastImport(new Date());
+      setLoading(false); // Libera a UI
+
+      // FASE 3: GERAR DANFE EM SEGUNDO PLANO (sem bloquear a UI)
+      if (savedOrdersInfo.length > 0 && paraInserir.length > 0) {
+        void generateDanfeInBackground(savedOrdersInfo, paraInserir);
+      }
+
+      // FASE 2: GEOCODIFICAR (Removido - GPS via App Motorista)
+      // O código de busca background foi removido conforme solicitação para otimizar o fluxo.
+
+
+    } catch (error) {
+      console.error('Error importing orders:', error);
+      toast.error('Erro ao importar pedidos. Tente novamente.');
+      setLoading(false);
+    }
+  };
+
+  const formatDateBR = (value: any) => {
+    if (!value) return '-';
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return '-';
+    return d.toLocaleDateString('pt-BR') + ' às ' + d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  const statusPT = (s: string | null | undefined) => {
+    switch (String(s || '').toLowerCase()) {
+      case 'pending': return 'Pendente';
+      case 'imported': return 'Importado';
+      case 'assigned': return 'Atribuído';
+      case 'delivered': return 'Entregue';
+      case 'returned': return 'Retornado';
+      default: return s || '-';
+    }
+  };
+  const pickZip = (raw: any) => {
+    const candidates = [raw?.destinatario_cep, raw?.cep, raw?.endereco_cep, raw?.codigo_postal, raw?.zip];
+    for (const c of candidates) { const s = String(c || '').trim(); if (s) return s; }
+    return '';
+  };
+  const pickSeller = (raw: any) => {
+    const direct = [raw?.vendedor_nome, raw?.vendedor, raw?.nome_vendedor, raw?.seller, raw?.atendente, raw?.responsavel_venda, raw?.operador];
+    for (const c of direct) { const s = String(c || '').trim(); if (s) return s; }
+    const arrs = [raw?.produtos, raw?.produtos_locais];
+    for (const arr of arrs) { if (Array.isArray(arr)) { for (const p of arr) { const s = String(p?.vendedor_nome || p?.vendedor || '').trim(); if (s) return s; } } }
+    try { for (const k of Object.keys(raw || {})) { if (k.toLowerCase().includes('vendedor')) { const s = String(raw[k] || '').trim(); if (s) return s; } } } catch { }
+    return '';
+  };
+
+  return (
+    <div className="w-full pb-12">
+      <div className="w-full p-4 sm:p-6 lg:p-8 py-8 space-y-6">
+
+        {/* Quick Stats */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+          <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-gray-500">Importados Hoje</p>
+              <p className="text-2xl font-bold text-gray-900">{stats.today}</p>
+            </div>
+            <div className="p-3 bg-blue-50 rounded-lg">
+              <Clock className="h-6 w-6 text-blue-600" />
+            </div>
+          </div>
+          <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-gray-500">Pendentes de Entrega</p>
+              <p className="text-2xl font-bold text-gray-900">{stats.pending}</p>
+            </div>
+            <div className="p-3 bg-orange-50 rounded-lg">
+              <AlertTriangle className="h-6 w-6 text-orange-600" />
+            </div>
+          </div>
+          <div className="bg-white rounded-xl p-5 shadow-sm border border-gray-100 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-medium text-gray-500">Total no Banco</p>
+              <p className="text-2xl font-bold text-gray-900">{stats.total}</p>
+            </div>
+            <div className="p-3 bg-green-50 rounded-lg">
+              <Package className="h-6 w-6 text-green-600" />
+            </div>
+          </div>
+        </div>
+
+        {/* Import Action Area */}
+        < div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8 mb-8 text-center relative overflow-hidden group" >
+          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-500 to-purple-500"></div>
+
+          <div className="max-w-xl mx-auto relative z-10">
+            <div className="mx-auto w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
+              <UploadCloud className="h-10 w-10 text-blue-600" />
+            </div>
+
+            <h2 className="text-2xl font-bold text-gray-900 mb-3">Sincronizar Pedidos</h2>
+            <p className="text-gray-500 mb-8">
+              Clique no botão abaixo para buscar novos pedidos do sistema ERP. O processo roda em segundo plano para não travar seu trabalho.
+            </p>
+
+            <button
+              onClick={importOrders}
+              disabled={loading}
+              className="inline-flex items-center px-8 py-4 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 focus:outline-none focus:ring-4 focus:ring-blue-200 disabled:opacity-50 disabled:cursor-not-allowed transition-all transform hover:-translate-y-1 shadow-lg hover:shadow-blue-200"
+            >
+              {loading ? (
+                <>
+                  <RefreshCw className="animate-spin h-5 w-5 mr-3" />
+                  Sincronizando...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="h-5 w-5 mr-3" />
+                  Iniciar Importação
+                </>
+              )}
+            </button>
+
+            {allowUpdatesConfig && (
+              <div className="mt-6 flex flex-col items-center animate-in fade-in slide-in-from-top-2">
+                <label className="flex items-center gap-2 cursor-pointer p-2 rounded-lg hover:bg-gray-50 transition-colors border border-transparent hover:border-gray-100">
+                  <input
+                    type="checkbox"
+                    checked={updateExisting}
+                    onChange={(e) => setUpdateExisting(e.target.checked)}
+                    className="h-4 w-4 text-orange-600 border-gray-300 rounded focus:ring-orange-500"
+                  />
+                  <div className="text-left">
+                    <span className="text-sm font-medium text-gray-700 block">Atualizar dados de pedidos já existentes</span>
+                    {updateExisting && (
+                      <span className="text-xs text-orange-600 block">⚠️ Atualiza descrição e grupos. Mantém status e histórico.</span>
+                    )}
+                  </div>
+                </label>
+              </div>
+            )}
+
+            {lastImport && (
+              <p className="text-xs text-gray-400 mt-4">
+                Última sincronização: {lastImport.toLocaleString('pt-BR')}
+              </p>
+            )}
+          </div>
+        </div >
+
+
+        {/* Orders Table */}
+        < div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden" >
+          <div className="px-6 py-4 border-b border-gray-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-gray-50">
+            <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+              <Package className="h-5 w-5 text-gray-500" />
+              Histórico de Importação
+            </h3>
+            <div className="flex items-center gap-3 w-full sm:w-auto">
+              <div className="relative flex-1 sm:flex-none">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+                <input
+                  type="text"
+                  placeholder="Buscar romaneio..."
+                  value={searchManifest}
+                  onChange={(e) => { setSearchManifest(e.target.value); setManifestPage(0); }}
+                  className="pl-9 pr-3 py-2 text-sm border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-200 focus:border-blue-400 outline-none w-full sm:w-48 transition-colors"
+                />
+              </div>
+              <span className="text-xs font-medium text-gray-500 bg-white px-2 py-1 rounded border border-gray-200 whitespace-nowrap">
+                {stats.total} pedidos
+              </span>
+            </div>
+          </div>
+
+          {
+            (() => {
+              if (manifestSummaries.length === 0) {
+                return (
+                  <div className="p-12 text-center">
+                    <Package className="h-12 w-12 text-gray-300 mx-auto mb-4" />
+                    <h3 className="text-lg font-medium text-gray-900">Nenhum pedido encontrado</h3>
+                    <p className="text-gray-500">
+                      {searchManifest.trim() ? `Nenhum romaneio encontrado para "${searchManifest}"` : 'Clique em importar para sincronizar os dados.'}
+                    </p>
+                  </div>
+                );
+              }
+              const totalManifestPages = Math.ceil(manifestTotalCount / MANIFESTS_PER_PAGE);
+
+              return (
+                <div className="overflow-x-auto p-4 space-y-4">
+                  {manifestSummaries.map(summary => {
+                    const manifestKey = summary.manifest_key;
+                    const group = manifestDetails[manifestKey] || [];
+                    const isExpanded = expandedManifests[manifestKey];
+                    const isAvulso = Boolean(summary.is_avulso);
+                    const title = isAvulso ? 'Pedidos Individuais (Sem Romaneio / Antigos)' : `Romaneio #${summary.manifest_id || manifestKey}`;
+                    const groupDate = summary.imported_at ? formatDateBR(summary.imported_at) : '-';
+                    const totalItems = Number(summary.total_orders || 0);
+
+                    return (
+                      <div key={manifestKey} className="bg-white border text-sm border-gray-200 rounded-xl shadow-sm overflow-hidden">
+                        <button
+                          onClick={() => { void toggleManifest(summary); }}
+                          className="w-full flex items-center justify-between p-4 bg-gray-50 hover:bg-gray-100 transition-colors"
+                        >
+                          <div className="flex items-center gap-4">
+                            <div className={`p-2 rounded-lg ${isAvulso ? 'bg-orange-100 text-orange-600' : 'bg-blue-100 text-blue-600'}`}>
+                              <Package className="h-5 w-5" />
+                            </div>
+                            <div className="text-left">
+                              <span className="font-bold text-gray-900 block">{title}</span>
+                              <span className="text-gray-500 text-xs mt-0.5 block">{totalItems} pedidos • Importado em {groupDate}</span>
+                            </div>
+                          </div>
+                          <div className="text-gray-400">
+                            {isExpanded ? <ChevronUp className="h-5 w-5" /> : <ChevronDown className="h-5 w-5" />}
+                          </div>
+                        </button>
+
+                        {isExpanded && (
+                          <div className="border-t border-gray-100 p-2">
+                            {manifestLoading[manifestKey] ? (
+                              <div className="p-6 text-center text-sm text-gray-500">Carregando pedidos do romaneio...</div>
+                            ) : (
+                            <table className="min-w-full divide-y divide-gray-100">
+                              <thead className="bg-white">
+                                <tr>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Pedido / Cliente</th>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Localização</th>
+                                  <th className="px-4 py-2 text-left text-xs font-semibold text-gray-400 uppercase tracking-wider">Status</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-gray-50">
+                                {group.map(o => {
+                                  const city = o.address_json?.city ?? '-';
+                                  const statusLabel = statusPT(o.status);
+                                  const docNum = String(o.order_id_erp ?? '-');
+
+                                  const statusColor = o.status === 'delivered' ? 'bg-green-100 text-green-800' :
+                                    o.status === 'returned' ? 'bg-red-100 text-red-800' :
+                                      o.status === 'assigned' ? 'bg-blue-100 text-blue-800' :
+                                        'bg-gray-100 text-gray-800';
+
+                                  return (
+                                    <tr key={o.id} className="hover:bg-gray-50 transition-colors">
+                                      <td className="px-4 py-3">
+                                        <div className="flex flex-col">
+                                          <span className="text-xs font-bold text-gray-900">#{docNum}</span>
+                                          <span className="text-xs text-gray-500">{o.customer_name}</span>
+                                        </div>
+                                      </td>
+                                      <td className="px-4 py-3 text-xs text-gray-700">
+                                        <div className="flex items-center gap-1">
+                                          <TruckIcon className="h-3 w-3 text-gray-400" />
+                                          {city}
+                                        </div>
+                                      </td>
+                                      <td className="px-4 py-3">
+                                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${statusColor}`}>
+                                          {statusLabel}
+                                        </span>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                  {/* Paginação */}
+                  {totalManifestPages > 1 && (
+                    <div className="flex items-center justify-between mt-6 px-2">
+                      <button
+                        onClick={() => setManifestPage(p => Math.max(0, p - 1))}
+                        disabled={manifestPage === 0}
+                        className="flex items-center gap-1 px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        Anterior
+                      </button>
+                      <span className="text-sm text-gray-500">
+                        Página {manifestPage + 1} de {totalManifestPages} ({manifestTotalCount} romaneios)
+                      </span>
+                      <button
+                        onClick={() => setManifestPage(p => Math.min(totalManifestPages - 1, p + 1))}
+                        disabled={manifestPage >= totalManifestPages - 1}
+                        className="flex items-center gap-1 px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+                      >
+                        Próxima
+                        <ChevronRight className="h-4 w-4" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })()
+          }
+        </div >
+      </div >
+    </div>
+  );
+}
