@@ -616,7 +616,7 @@ export class DeliveryProofPdfGenerator {
       });
     }
 
-    page.drawText('SOLIDGO', {
+    page.drawText('JOYGO', {
       x: contentX + contentW - 130,
       y: footerY + 6,
       size: 10,

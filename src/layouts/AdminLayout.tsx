@@ -61,15 +61,15 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
             )}
 
             <aside
-                className={`fixed inset-y-0 left-0 z-50 w-72 bg-[#0B1E36] transform transition-transform duration-300 ease-in-out lg:static lg:translate-x-0 flex flex-col ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'
+                className={`fixed inset-y-0 left-0 z-50 w-72 bg-[#2A0E12] transform transition-transform duration-300 ease-in-out lg:static lg:translate-x-0 flex flex-col ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'
                     }`}
             >
-                <div className="h-16 flex items-center justify-between px-6 bg-[#0B1E36] border-b border-white/10 shrink-0">
+                <div className="h-16 flex items-center justify-between px-6 bg-[#2A0E12] border-b border-white/10 shrink-0">
                     <div className="flex items-center gap-3">
                         <div className="bg-blue-600 p-2 rounded-lg shadow-sm shadow-blue-900/50">
                             <Truck className="h-5 w-5 text-white" />
                         </div>
-                        <span className="text-xl font-bold text-white tracking-wide">SOLID<span className="text-blue-400">GO</span></span>
+                        <span className="text-xl font-bold text-white tracking-wide">JOY<span className="text-blue-400">GO</span></span>
                     </div>
                     <button
                         onClick={() => setIsMobileMenuOpen(false)}
@@ -103,7 +103,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
                     </div>
                 </div>
 
-                <div className="p-4 border-t border-white/10 shrink-0 bg-[#0B1E36]">
+                <div className="p-4 border-t border-white/10 shrink-0 bg-[#2A0E12]">
                     <div className="flex items-center gap-3 px-3 py-3 rounded-lg bg-white/5 border border-white/5">
                         <div className="h-8 w-8 rounded-full bg-blue-600 flex items-center justify-center shrink-0">
                             <span className="text-sm font-bold text-white">
@@ -135,7 +135,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
                             <Menu className="h-6 w-6" />
                         </button>
                         <h1 className="text-xl font-semibold text-gray-800 lg:hidden">
-                            SOLIDGO
+                            JOYGO
                         </h1>
                         <h1 className="text-xl font-semibold text-gray-800 hidden lg:block">
                             {currentRoute.name}

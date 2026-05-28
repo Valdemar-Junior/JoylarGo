@@ -31,10 +31,10 @@ export function useFleetPwaMeta() {
     const previousAppleHref = appleTouchLink.href;
     const previousTheme = themeMeta.content;
 
-    document.title = 'SOLIDGO Frota';
+    document.title = 'JoyGo Frota';
     manifestLink.href = '/manifest-fleet.webmanifest';
     appleTouchLink.href = '/fleet-apple-touch-icon.png';
-    themeMeta.content = '#0f172a';
+    themeMeta.content = '#e11d48';
 
     return () => {
       document.title = previousTitle;

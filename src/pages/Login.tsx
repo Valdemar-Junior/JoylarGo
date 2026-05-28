@@ -88,7 +88,7 @@ export default function Login() {
             <div className="bg-white/20 p-2 rounded-lg backdrop-blur-sm">
               <Truck className="h-8 w-8 text-white" />
             </div>
-            <span className="text-2xl font-bold tracking-wide">SOLIDGO</span>
+            <span className="text-2xl font-bold tracking-wide">JOYGO</span>
           </div>
         </div>
 
