@@ -6,6 +6,14 @@
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
   line-height: 1.5;
   font-weight: 400;
+  --joylar-red-50: #fff1f2;
+  --joylar-red-100: #ffe4e6;
+  --joylar-red-200: #fecdd3;
+  --joylar-red-400: #fb7185;
+  --joylar-red-500: #f43f5e;
+  --joylar-red-600: #e11d48;
+  --joylar-red-700: #be123c;
+  --joylar-red-900: #881337;
 
   font-synthesis: none;
   text-rendering: optimizeLegibility;
@@ -70,10 +78,46 @@
 .react-datepicker__day--keyboard-selected,
 .react-datepicker__day--in-range,
 .react-datepicker__day--in-selecting-range {
-  background-color: #2563eb !important;
+  background-color: var(--joylar-red-600) !important;
   color: white !important;
 }
 
 .react-datepicker__day:hover {
-  background-color: #dbeafe !important;
+  background-color: var(--joylar-red-100) !important;
+}
+
+/* Joylar primary brand overrides for common Tailwind blue utilities */
+.bg-blue-600 { background-color: var(--joylar-red-600) !important; }
+.bg-blue-500 { background-color: var(--joylar-red-500) !important; }
+.bg-blue-100 { background-color: var(--joylar-red-100) !important; }
+.bg-blue-50 { background-color: var(--joylar-red-50) !important; }
+.text-blue-700 { color: var(--joylar-red-700) !important; }
+.text-blue-600 { color: var(--joylar-red-600) !important; }
+.text-blue-500 { color: var(--joylar-red-500) !important; }
+.text-blue-400 { color: var(--joylar-red-400) !important; }
+.border-blue-500 { border-color: var(--joylar-red-500) !important; }
+.border-blue-200 { border-color: var(--joylar-red-200) !important; }
+.border-blue-100 { border-color: var(--joylar-red-100) !important; }
+.from-blue-600 { --tw-gradient-from: var(--joylar-red-600) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(225 29 72 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+.from-blue-500 { --tw-gradient-from: var(--joylar-red-500) var(--tw-gradient-from-position) !important; --tw-gradient-to: rgb(244 63 94 / 0) var(--tw-gradient-to-position) !important; --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+.to-blue-700 { --tw-gradient-to: var(--joylar-red-700) var(--tw-gradient-to-position) !important; }
+.to-blue-600 { --tw-gradient-to: var(--joylar-red-600) var(--tw-gradient-to-position) !important; }
+.shadow-blue-900\/50 { --tw-shadow-color: rgb(136 19 55 / 0.5) !important; --tw-shadow: var(--tw-shadow-colored) !important; }
+.shadow-blue-900\/20 { --tw-shadow-color: rgb(136 19 55 / 0.2) !important; --tw-shadow: var(--tw-shadow-colored) !important; }
+.shadow-blue-200 { --tw-shadow-color: rgb(254 205 211 / 1) !important; --tw-shadow: var(--tw-shadow-colored) !important; }
+.hover\:bg-blue-700:hover { background-color: var(--joylar-red-700) !important; }
+.hover\:bg-blue-600:hover { background-color: var(--joylar-red-600) !important; }
+.hover\:bg-blue-100:hover { background-color: var(--joylar-red-100) !important; }
+.hover\:bg-blue-50:hover { background-color: var(--joylar-red-50) !important; }
+.hover\:text-blue-600:hover { color: var(--joylar-red-600) !important; }
+.hover\:text-blue-700:hover { color: var(--joylar-red-700) !important; }
+.hover\:border-blue-200:hover { border-color: var(--joylar-red-200) !important; }
+.focus\:ring-blue-500:focus,
+.focus\:ring-blue-500:focus-visible { --tw-ring-color: var(--joylar-red-500) !important; }
+.focus\:border-blue-500:focus,
+.focus\:border-blue-500:focus-visible { border-color: var(--joylar-red-500) !important; }
+.focus\:placeholder-gray-400:focus::placeholder { color: rgb(156 163 175) !important; }
+.selection\:bg-blue-500\/30::selection { background-color: rgb(244 63 94 / 0.3) !important; }
+.bg-gradient-to-br.from-blue-600.to-indigo-900 {
+  background-image: linear-gradient(to bottom right, #991b1b, #3f0d16) !important;
 }

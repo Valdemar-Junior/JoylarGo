@@ -111,10 +111,10 @@ export default function UsersTeams() {
       const pwd = uPassword.trim() ? uPassword.trim() : genPassword();
 
       let pseudoEmail = toLoginEmailFromName(uName);
-      if (users.some(existingUser => existingUser.email === pseudoEmail)) {
-        const base = slugifyName(uName);
-        pseudoEmail = `${base}.${String(Date.now()).slice(-4)}@solidgo.local`;
-      }
+        if (users.some(existingUser => existingUser.email === pseudoEmail)) {
+          const base = slugifyName(uName);
+          pseudoEmail = `${base}.${String(Date.now()).slice(-4)}@joylar.local`;
+        }
 
       const functionUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/create-user`;
       if (!functionUrl || !functionUrl.startsWith('http')) {

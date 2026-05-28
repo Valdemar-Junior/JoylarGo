@@ -13,5 +13,5 @@ export function slugifyName(name: string) {
 
 export function toLoginEmailFromName(name: string) {
   const slug = slugifyName(name)
-  return `${slug || 'usuario' }@solidgo.local`
+  return `${slug || 'usuario' }@joylar.local`
 }
