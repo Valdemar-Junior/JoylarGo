@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { supabase } from '../supabase/client';
-import { toLoginEmailFromName } from '../lib/utils';
+import { slugifyName, toLoginEmailFromName } from '../lib/utils';
 import type { User } from '../types/database';
 
 interface AuthState {
@@ -29,13 +29,28 @@ export const useAuthStore = create<AuthState>()(
 
         try {
           console.log('Attempting Supabase auth signInWithPassword...');
-          // Resolve email: se existir perfil com nome igual ao identificador, usar o email do perfil
-          let loginEmail = identifier.includes('@') ? identifier : toLoginEmailFromName(identifier);
-          if (!identifier.includes('@')) {
-            const { data: byName } = await supabase.from('users').select('email').eq('name', identifier).maybeSingle();
-            if (byName?.email) loginEmail = byName.email;
+          // Compatibilidade: usuários antigos podem estar em @solidgo.local e novos em @joylar.local
+          const loginCandidates = identifier.includes('@')
+            ? [identifier]
+            : Array.from(
+                new Set([
+                  toLoginEmailFromName(identifier),
+                  `${slugifyName(identifier) || 'usuario'}@solidgo.local`,
+                ])
+              );
+
+          let data: any = null;
+          let error: any = null;
+          for (const loginEmail of loginCandidates) {
+            const result = await supabase.auth.signInWithPassword({ email: loginEmail, password });
+            data = result.data;
+            error = result.error;
+            if (!error) break;
+            const msg = String(error.message || '').toLowerCase();
+            if (!(msg.includes('invalid') || msg.includes('credentials'))) {
+              break;
+            }
           }
-          const { data, error } = await supabase.auth.signInWithPassword({ email: loginEmail, password });
 
           console.log('Supabase auth result:', { data, error });
 
@@ -268,7 +283,6 @@ supabase.auth.onAuthStateChange(async (event) => {
     useAuthStore.getState().checkAuth();
   }
 });
-
 
 
 
