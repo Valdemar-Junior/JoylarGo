@@ -14,8 +14,6 @@ import {
     LogOut,
     Menu,
     X,
-    UserCircle,
-    Bell,
     Box,
     CarFront
 } from 'lucide-react';
@@ -66,10 +64,10 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
             >
                 <div className="h-16 flex items-center justify-between px-6 bg-[#2A0E12] border-b border-white/10 shrink-0">
                     <div className="flex items-center gap-3">
-                        <div className="bg-blue-600 p-2 rounded-lg shadow-sm shadow-blue-900/50">
+                        <div className="bg-red-600 p-2 rounded-lg shadow-sm shadow-red-900/50">
                             <Truck className="h-5 w-5 text-white" />
                         </div>
-                        <span className="text-xl font-bold text-white tracking-wide">JOY<span className="text-blue-400">GO</span></span>
+                        <span className="text-xl font-bold text-white tracking-wide">JOY<span className="text-red-400">GO</span></span>
                     </div>
                     <button
                         onClick={() => setIsMobileMenuOpen(false)}
@@ -88,12 +86,12 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
                                     key={item.href}
                                     to={item.href}
                                     className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all group ${isActive
-                                        ? 'bg-blue-600 text-white shadow-md shadow-blue-900/20'
+                                        ? 'bg-red-600 text-white shadow-md shadow-red-900/20'
                                         : 'text-gray-300 hover:bg-white/5 hover:text-white'
                                         }`}
                                 >
                                     <item.icon
-                                        className={`h-5 w-5 shrink-0 ${isActive ? 'text-white' : 'text-gray-400 group-hover:text-blue-400'
+                                        className={`h-5 w-5 shrink-0 ${isActive ? 'text-white' : 'text-gray-400 group-hover:text-red-400'
                                             }`}
                                     />
                                     {item.name}
@@ -105,7 +103,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
 
                 <div className="p-4 border-t border-white/10 shrink-0 bg-[#2A0E12]">
                     <div className="flex items-center gap-3 px-3 py-3 rounded-lg bg-white/5 border border-white/5">
-                        <div className="h-8 w-8 rounded-full bg-blue-600 flex items-center justify-center shrink-0">
+                        <div className="h-8 w-8 rounded-full bg-red-600 flex items-center justify-center shrink-0">
                             <span className="text-sm font-bold text-white">
                                 {user?.name?.charAt(0).toUpperCase() || 'A'}
                             </span>
@@ -126,7 +124,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
             </aside>
 
             <div className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden">
-                <header className="h-16 bg-white border-b border-gray-200 flex items-center justify-between px-4 sm:px-6 z-10 shrink-0">
+                <header className="h-16 bg-white border-b border-gray-200 flex items-center px-4 sm:px-6 z-10 shrink-0">
                     <div className="flex items-center gap-3">
                         <button
                             onClick={() => setIsMobileMenuOpen(true)}
@@ -140,23 +138,6 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
                         <h1 className="text-xl font-semibold text-gray-800 hidden lg:block">
                             {currentRoute.name}
                         </h1>
-                    </div>
-
-                    <div className="flex items-center gap-2 sm:gap-4">
-                        <button className="p-2 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-full transition-colors relative">
-                            <Bell className="h-5 w-5" />
-                            <span className="absolute top-1.5 right-1.5 h-2 w-2 bg-red-500 rounded-full border border-white"></span>
-                        </button>
-
-                        <div className="h-6 w-px bg-gray-200 mx-1"></div>
-
-                        <div className="flex items-center gap-2">
-                            <div className="hidden sm:block text-right">
-                                <p className="text-sm font-medium text-gray-900 leading-none">{user?.name || 'Admin'}</p>
-                                <p className="text-xs text-gray-500 mt-1">{user?.role === 'admin' ? 'Gestor' : 'Usuário'}</p>
-                            </div>
-                            <UserCircle className="h-8 w-8 text-gray-400" />
-                        </div>
                     </div>
                 </header>
 
