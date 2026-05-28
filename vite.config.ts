@@ -35,14 +35,12 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: [
         'favicon.svg',
-        'favicon.ico',
-        'apple-touch-icon.png',
-        'mask-icon.svg',
         'fleet-apple-touch-icon.png',
         'fleet-pwa-64x64.png',
         'fleet-pwa-192x192.png',
         'fleet-pwa-512x512.png',
-        'manifest-fleet.webmanifest'
+        'manifest-fleet.webmanifest',
+        'logo.png'
       ],
       manifest: {
         name: 'solidgo',
@@ -55,23 +53,23 @@ export default defineConfig({
         start_url: '/',
         icons: [
           {
-            src: 'pwa-64x64.png',
+            src: 'fleet-pwa-64x64.png',
             sizes: '64x64',
             type: 'image/png'
           },
           {
-            src: 'pwa-192x192.png',
+            src: 'fleet-pwa-192x192.png',
             sizes: '192x192',
             type: 'image/png'
           },
           {
-            src: 'pwa-512x512.png',
+            src: 'fleet-pwa-512x512.png',
             sizes: '512x512',
             type: 'image/png',
             purpose: 'any'
           },
           {
-            src: 'pwa-512x512.png',
+            src: 'fleet-pwa-512x512.png',
             sizes: '512x512',
             type: 'image/png',
             purpose: 'maskable'
