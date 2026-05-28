@@ -46,6 +46,7 @@ export default defineConfig({
         name: 'solidgo',
         short_name: 'solidgo',
         description: 'Gerenciamento de rotas e entregas',
+        lang: 'pt-BR',
         theme_color: '#ffffff',
         background_color: '#ffffff',
         display: 'standalone',
