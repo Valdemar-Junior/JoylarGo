@@ -29,7 +29,8 @@ export const supabase = envOk ? createClient(supabaseUrl, supabaseAnonKey, {
     persistSession: true,
     autoRefreshToken: true,
     detectSessionInUrl: true,
-    storage: window.sessionStorage,
+    // localStorage keeps the Supabase session available across browser tabs.
+    storage: window.localStorage,
     storageKey: 'sb-auth-token',
   },
   realtime: {

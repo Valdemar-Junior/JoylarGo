@@ -20,7 +20,7 @@ export const useAuthStore = create<AuthState>()(
     (set, get) => ({
       user: null,
       isAuthenticated: false,
-      isLoading: false,
+      isLoading: true,
       error: null,
 
       login: async (identifier: string, password: string) => {
@@ -131,7 +131,7 @@ export const useAuthStore = create<AuthState>()(
       logout: async () => {
         set({ isLoading: true });
         try {
-          try { sessionStorage.setItem('auth_lock', '1'); } catch { }
+          try { localStorage.setItem('auth_lock', '1'); } catch { }
           await supabase.auth.signOut({ scope: 'local' });
         } catch (error: any) {
           console.warn('Logout warning:', error?.message || error);
@@ -259,7 +259,7 @@ export const useAuthStore = create<AuthState>()(
     }),
     {
       name: 'auth-storage',
-      storage: typeof window !== 'undefined' ? createJSONStorage(() => sessionStorage) : undefined,
+      storage: typeof window !== 'undefined' ? createJSONStorage(() => localStorage) : undefined,
       partialize: (state) => ({
         user: state.user,
         isAuthenticated: state.isAuthenticated,
@@ -283,6 +283,5 @@ supabase.auth.onAuthStateChange(async (event) => {
     useAuthStore.getState().checkAuth();
   }
 });
-
 
 
