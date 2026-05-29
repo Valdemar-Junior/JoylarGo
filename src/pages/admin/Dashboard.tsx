@@ -30,7 +30,7 @@ interface DashboardMetrics {
   pending_deliveries: number;
   completed_deliveries: number;
   success_rate: number;
-  expired_returns: number;
+  total_returns: number;
 }
 
 interface RouteRow {
@@ -45,7 +45,7 @@ const DAYS = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
 const STATUS_COLORS: Record<string, string> = {
   Entregues: '#10b981',
   Pendentes: '#f59e0b',
-  Devolvidos: '#ef4444',
+  Retornados: '#ef4444',
 };
 
 export default function AdminDashboard() {
@@ -54,7 +54,7 @@ export default function AdminDashboard() {
     pending_deliveries: 0,
     completed_deliveries: 0,
     success_rate: 0,
-    expired_returns: 0,
+    total_returns: 0,
   });
   const [weekData, setWeekData] = useState<{ day: string; Entregues: number; Pendentes: number }[]>([]);
   const [statusPie, setStatusPie] = useState<{ name: string; value: number }[]>([]);
@@ -94,14 +94,14 @@ export default function AdminDashboard() {
         pending_deliveries: pendingCount || 0,
         completed_deliveries: completedCount || 0,
         success_rate: successRate,
-        expired_returns: returnedCount || 0,
+        total_returns: returnedCount || 0,
       });
 
       // Pie: status geral
       setStatusPie([
         { name: 'Entregues', value: completedCount || 0 },
         { name: 'Pendentes', value: pendingCount || 0 },
-        { name: 'Devolvidos', value: returnedCount || 0 },
+        { name: 'Retornados', value: returnedCount || 0 },
       ]);
 
       // Weekly bar chart: últimos 7 dias
@@ -144,7 +144,7 @@ export default function AdminDashboard() {
     { label: 'Pendentes', value: metrics.pending_deliveries, icon: Package, gradient: 'from-amber-400 to-orange-500', bg: 'bg-amber-50', text: 'text-amber-700' },
     { label: 'Entregues Hoje', value: metrics.completed_deliveries, icon: CheckCircle2, gradient: 'from-emerald-500 to-green-600', bg: 'bg-emerald-50', text: 'text-emerald-700' },
     { label: 'Taxa de Sucesso', value: `${metrics.success_rate}%`, icon: TrendingUp, gradient: 'from-purple-500 to-indigo-600', bg: 'bg-purple-50', text: 'text-purple-700' },
-    { label: 'Devoluções', value: metrics.expired_returns, icon: AlertTriangle, gradient: 'from-red-500 to-rose-600', bg: 'bg-red-50', text: 'text-red-700' },
+    { label: 'Retornos', value: metrics.total_returns, icon: AlertTriangle, gradient: 'from-red-500 to-rose-600', bg: 'bg-red-50', text: 'text-red-700' },
   ];
 
   const statusBadge: Record<string, string> = {
